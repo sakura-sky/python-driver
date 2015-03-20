@@ -1,4 +1,4 @@
-# Copyright 2013-2014 DataStax, Inc.
+# Copyright 2013-2015 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,13 +17,17 @@ import time
 try:
     import unittest2 as unittest
 except ImportError:
-    import unittest # noqa
+    import unittest  # noqa
 
 from cassandra.query import SimpleStatement
 from cassandra import ConsistencyLevel, WriteTimeout, Unavailable, ReadTimeout
 
 from cassandra.cluster import Cluster, NoHostAvailable
-from tests.integration import get_node, get_cluster, PROTOCOL_VERSION
+from tests.integration import get_cluster, get_node, use_singledc, PROTOCOL_VERSION
+
+
+def setup_module():
+    use_singledc()
 
 
 class MetricsTests(unittest.TestCase):
@@ -51,9 +55,10 @@ class MetricsTests(unittest.TestCase):
             # Ensure the nodes are actually down
             self.assertRaises(NoHostAvailable, session.execute, "USE test3rf")
         finally:
-            get_cluster().start(wait_for_binary_proto=True)
+            get_cluster().start(wait_for_binary_proto=True, wait_other_notice=True)
 
         self.assertGreater(cluster.metrics.stats.connection_errors, 0)
+        cluster.shutdown()
 
     def test_write_timeout(self):
         """
@@ -86,6 +91,8 @@ class MetricsTests(unittest.TestCase):
         finally:
             get_node(1).start(wait_other_notice=True, wait_for_binary_proto=True)
 
+        cluster.shutdown()
+
     def test_read_timeout(self):
         """
         Trigger and ensure read_timeouts are counted
@@ -116,6 +123,8 @@ class MetricsTests(unittest.TestCase):
 
         finally:
             get_node(1).start(wait_other_notice=True, wait_for_binary_proto=True)
+
+        cluster.shutdown()
 
     def test_unavailable(self):
         """
@@ -152,6 +161,8 @@ class MetricsTests(unittest.TestCase):
             self.assertEqual(2, cluster.metrics.stats.unavailables)
         finally:
             get_node(1).start(wait_other_notice=True, wait_for_binary_proto=True)
+
+        cluster.shutdown()
 
     def test_other_error(self):
         # TODO: Bootstrapping or Overloaded cases

@@ -1,4 +1,4 @@
-# Copyright 2013-2014 DataStax, Inc.
+# Copyright 2013-2015 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,15 +15,14 @@
 try:
     import unittest2 as unittest
 except ImportError:
-    import unittest # noqa
-
-from mock import Mock, ANY
+    import unittest  # noqa
 
 from concurrent.futures import ThreadPoolExecutor
+from mock import Mock, ANY, call
 
 from cassandra import OperationTimedOut
 from cassandra.protocol import ResultMessage, RESULT_KIND_ROWS
-from cassandra.cluster import ControlConnection, Cluster, _Scheduler
+from cassandra.cluster import ControlConnection, _Scheduler
 from cassandra.pool import Host
 from cassandra.policies import (SimpleConvictionPolicy, RoundRobinPolicy,
                                 ConstantReconnectionPolicy)
@@ -59,7 +58,7 @@ class MockMetadata(object):
 
 class MockCluster(object):
 
-    max_schema_agreement_wait = Cluster.max_schema_agreement_wait
+    max_schema_agreement_wait = 5
     load_balancing_policy = RoundRobinPolicy()
     reconnection_policy = ConstantReconnectionPolicy(2)
     down_host = None
@@ -73,7 +72,7 @@ class MockCluster(object):
         self.scheduler = Mock(spec=_Scheduler)
         self.executor = Mock(spec=ThreadPoolExecutor)
 
-    def add_host(self, address, datacenter, rack, signal=False):
+    def add_host(self, address, datacenter, rack, signal=False, refresh_nodes=True):
         host = Host(address, SimpleConvictionPolicy, datacenter, rack)
         self.added_hosts.append(host)
         return host
@@ -131,7 +130,7 @@ class ControlConnectionTest(unittest.TestCase):
         self.connection = MockConnection()
         self.time = FakeTime()
 
-        self.control_connection = ControlConnection(self.cluster, timeout=0.01)
+        self.control_connection = ControlConnection(self.cluster, 1, 0, 0)
         self.control_connection._connection = self.connection
         self.control_connection._time = self.time
 
@@ -206,7 +205,7 @@ class ControlConnectionTest(unittest.TestCase):
         self.connection.peer_results[1][1][2] = 'b'
         self.assertFalse(self.control_connection.wait_for_schema_agreement())
         # the control connection should have slept until it hit the limit
-        self.assertGreaterEqual(self.time.clock, Cluster.max_schema_agreement_wait)
+        self.assertGreaterEqual(self.time.clock, self.cluster.max_schema_agreement_wait)
 
     def test_wait_for_schema_agreement_skipping(self):
         """
@@ -247,7 +246,7 @@ class ControlConnectionTest(unittest.TestCase):
         # but once we mark it up, the control connection will care
         host.is_up = True
         self.assertFalse(self.control_connection.wait_for_schema_agreement())
-        self.assertGreaterEqual(self.time.clock, Cluster.max_schema_agreement_wait)
+        self.assertGreaterEqual(self.time.clock, self.cluster.max_schema_agreement_wait)
 
     def test_refresh_nodes_and_tokens(self):
         self.control_connection.refresh_node_list_and_token_map()
@@ -332,51 +331,57 @@ class ControlConnectionTest(unittest.TestCase):
     def test_refresh_schema_timeout(self):
 
         def bad_wait_for_responses(*args, **kwargs):
-            self.assertEqual(kwargs['timeout'], self.control_connection._timeout)
+            self.time.sleep(kwargs['timeout'])
             raise OperationTimedOut()
 
-        self.connection.wait_for_responses = bad_wait_for_responses
+        self.connection.wait_for_responses = Mock(side_effect=bad_wait_for_responses)
         self.control_connection.refresh_schema()
-        self.cluster.executor.submit.assert_called_with(self.control_connection._reconnect)
+        self.assertEqual(self.connection.wait_for_responses.call_count, self.cluster.max_schema_agreement_wait / self.control_connection._timeout)
+        self.assertEqual(self.connection.wait_for_responses.call_args[1]['timeout'], self.control_connection._timeout)
 
     def test_handle_topology_change(self):
         event = {
             'change_type': 'NEW_NODE',
             'address': ('1.2.3.4', 9000)
         }
+        self.cluster.scheduler.reset_mock()
         self.control_connection._handle_topology_change(event)
-        self.cluster.scheduler.schedule.assert_called_with(ANY, self.control_connection.refresh_node_list_and_token_map)
+        self.cluster.scheduler.schedule_unique.assert_called_once_with(ANY, self.control_connection.refresh_node_list_and_token_map)
 
         event = {
             'change_type': 'REMOVED_NODE',
             'address': ('1.2.3.4', 9000)
         }
+        self.cluster.scheduler.reset_mock()
         self.control_connection._handle_topology_change(event)
-        self.cluster.scheduler.schedule.assert_called_with(ANY, self.cluster.remove_host, None)
+        self.cluster.scheduler.schedule_unique.assert_called_once_with(ANY, self.cluster.remove_host, None)
 
         event = {
             'change_type': 'MOVED_NODE',
             'address': ('1.2.3.4', 9000)
         }
+        self.cluster.scheduler.reset_mock()
         self.control_connection._handle_topology_change(event)
-        self.cluster.scheduler.schedule.assert_called_with(ANY, self.control_connection.refresh_node_list_and_token_map)
+        self.cluster.scheduler.schedule_unique.assert_called_once_with(ANY, self.control_connection.refresh_node_list_and_token_map)
 
     def test_handle_status_change(self):
         event = {
             'change_type': 'UP',
             'address': ('1.2.3.4', 9000)
         }
+        self.cluster.scheduler.reset_mock()
         self.control_connection._handle_status_change(event)
-        self.cluster.scheduler.schedule.assert_called_with(ANY, self.control_connection.refresh_node_list_and_token_map)
+        self.cluster.scheduler.schedule_unique.assert_called_once_with(ANY, self.control_connection.refresh_node_list_and_token_map)
 
         # do the same with a known Host
         event = {
             'change_type': 'UP',
             'address': ('192.168.1.0', 9000)
         }
+        self.cluster.scheduler.reset_mock()
         self.control_connection._handle_status_change(event)
         host = self.cluster.metadata.hosts['192.168.1.0']
-        self.cluster.scheduler.schedule.assert_called_with(ANY, self.cluster.on_up, host)
+        self.cluster.scheduler.schedule_unique.assert_called_once_with(ANY, self.cluster.on_up, host)
 
         self.cluster.scheduler.schedule.reset_mock()
         event = {
@@ -397,27 +402,65 @@ class ControlConnectionTest(unittest.TestCase):
 
     def test_handle_schema_change(self):
 
-        for change_type in ('CREATED', 'DROPPED'):
+        for change_type in ('CREATED', 'DROPPED', 'UPDATED'):
             event = {
                 'change_type': change_type,
                 'keyspace': 'ks1',
                 'table': 'table1'
             }
+            self.cluster.scheduler.reset_mock()
             self.control_connection._handle_schema_change(event)
-            self.cluster.executor.submit.assert_called_with(self.control_connection.refresh_schema, 'ks1')
+            self.cluster.scheduler.schedule_unique.assert_called_once_with(0.0, self.control_connection.refresh_schema, 'ks1', 'table1', None)
 
+            self.cluster.scheduler.reset_mock()
             event['table'] = None
             self.control_connection._handle_schema_change(event)
-            self.cluster.executor.submit.assert_called_with(self.control_connection.refresh_schema, None)
+            self.cluster.scheduler.schedule_unique.assert_called_once_with(0.0, self.control_connection.refresh_schema, 'ks1', None, None)
 
-        event = {
-            'change_type': 'UPDATED',
+    def test_refresh_disabled(self):
+        cluster = MockCluster()
+
+        schema_event = {
+            'change_type': 'CREATED',
             'keyspace': 'ks1',
             'table': 'table1'
         }
-        self.control_connection._handle_schema_change(event)
-        self.cluster.executor.submit.assert_called_with(self.control_connection.refresh_schema, 'ks1', 'table1')
 
-        event['table'] = None
-        self.control_connection._handle_schema_change(event)
-        self.cluster.executor.submit.assert_called_with(self.control_connection.refresh_schema, 'ks1', None)
+        status_event = {
+            'change_type': 'UP',
+            'address': ('1.2.3.4', 9000)
+        }
+
+        topo_event = {
+            'change_type': 'MOVED_NODE',
+            'address': ('1.2.3.4', 9000)
+        }
+
+        cc_no_schema_refresh = ControlConnection(cluster, 1, -1, 0)
+        cluster.scheduler.reset_mock()
+
+        # no call on schema refresh
+        cc_no_schema_refresh._handle_schema_change(schema_event)
+        self.assertFalse(cluster.scheduler.schedule.called)
+        self.assertFalse(cluster.scheduler.schedule_unique.called)
+
+        # topo and status changes as normal
+        cc_no_schema_refresh._handle_status_change(status_event)
+        cc_no_schema_refresh._handle_topology_change(topo_event)
+        cluster.scheduler.schedule_unique.assert_has_calls([call(ANY, cc_no_schema_refresh.refresh_node_list_and_token_map),
+                                                            call(ANY, cc_no_schema_refresh.refresh_node_list_and_token_map)])
+
+        cc_no_topo_refresh = ControlConnection(cluster, 1, 0, -1)
+        cluster.scheduler.reset_mock()
+
+        # no call on topo refresh
+        cc_no_topo_refresh._handle_topology_change(topo_event)
+        self.assertFalse(cluster.scheduler.schedule.called)
+        self.assertFalse(cluster.scheduler.schedule_unique.called)
+
+        # schema and status change refresh as normal
+        cc_no_topo_refresh._handle_status_change(status_event)
+        cc_no_topo_refresh._handle_schema_change(schema_event)
+        cluster.scheduler.schedule_unique.assert_has_calls([call(ANY, cc_no_topo_refresh.refresh_node_list_and_token_map),
+                                                            call(0.0, cc_no_topo_refresh.refresh_schema,
+                                                                 schema_event['keyspace'], schema_event['table'], None)])

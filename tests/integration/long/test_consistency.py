@@ -1,4 +1,4 @@
-# Copyright 2013-2014 DataStax, Inc.
+# Copyright 2013-2015 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ from cassandra.cluster import Cluster
 from cassandra.policies import TokenAwarePolicy, RoundRobinPolicy, \
     DowngradingConsistencyRetryPolicy
 from cassandra.query import SimpleStatement
-from tests.integration import PROTOCOL_VERSION
+from tests.integration import use_singledc, PROTOCOL_VERSION
 
 from tests.integration.long.utils import force_stop, create_schema, \
     wait_for_down, wait_for_up, start, CoordinatorStats
@@ -29,7 +29,7 @@ from tests.integration.long.utils import force_stop, create_schema, \
 try:
     import unittest2 as unittest
 except ImportError:
-    import unittest # noqa
+    import unittest  # noqa
 
 ALL_CONSISTENCY_LEVELS = set([
     ConsistencyLevel.ANY, ConsistencyLevel.ONE, ConsistencyLevel.TWO,
@@ -41,6 +41,10 @@ MULTI_DC_CONSISTENCY_LEVELS = set([
     ConsistencyLevel.LOCAL_QUORUM, ConsistencyLevel.EACH_QUORUM])
 
 SINGLE_DC_CONSISTENCY_LEVELS = ALL_CONSISTENCY_LEVELS - MULTI_DC_CONSISTENCY_LEVELS
+
+
+def setup_module():
+    use_singledc()
 
 
 class ConsistencyTests(unittest.TestCase):
@@ -132,14 +136,16 @@ class ConsistencyTests(unittest.TestCase):
 
             self._assert_writes_succeed(session, keyspace, accepted)
             self._assert_reads_succeed(session, keyspace,
-                    accepted - set([ConsistencyLevel.ANY]))
+                                       accepted - set([ConsistencyLevel.ANY]))
             self._assert_writes_fail(session, keyspace,
-                    SINGLE_DC_CONSISTENCY_LEVELS - accepted)
+                                     SINGLE_DC_CONSISTENCY_LEVELS - accepted)
             self._assert_reads_fail(session, keyspace,
-                    SINGLE_DC_CONSISTENCY_LEVELS - accepted)
+                                    SINGLE_DC_CONSISTENCY_LEVELS - accepted)
         finally:
             start(2)
             wait_for_up(cluster, 2)
+
+        cluster.shutdown()
 
     def test_rfone_tokenaware_one_node_down(self):
         self._test_tokenaware_one_node_down(
@@ -180,8 +186,10 @@ class ConsistencyTests(unittest.TestCase):
 
         self._assert_writes_succeed(session, keyspace, SINGLE_DC_CONSISTENCY_LEVELS)
         self._assert_reads_succeed(session, keyspace,
-                SINGLE_DC_CONSISTENCY_LEVELS - set([ConsistencyLevel.ANY]),
-                expected_reader=2)
+                                   SINGLE_DC_CONSISTENCY_LEVELS - set([ConsistencyLevel.ANY]),
+                                   expected_reader=2)
+
+        cluster.shutdown()
 
     def _test_downgrading_cl(self, keyspace, rf, accepted):
         cluster = Cluster(
@@ -203,14 +211,16 @@ class ConsistencyTests(unittest.TestCase):
 
             self._assert_writes_succeed(session, keyspace, accepted)
             self._assert_reads_succeed(session, keyspace,
-                    accepted - set([ConsistencyLevel.ANY]))
+                                       accepted - set([ConsistencyLevel.ANY]))
             self._assert_writes_fail(session, keyspace,
-                    SINGLE_DC_CONSISTENCY_LEVELS - accepted)
+                                     SINGLE_DC_CONSISTENCY_LEVELS - accepted)
             self._assert_reads_fail(session, keyspace,
-                    SINGLE_DC_CONSISTENCY_LEVELS - accepted)
+                                    SINGLE_DC_CONSISTENCY_LEVELS - accepted)
         finally:
             start(2)
             wait_for_up(cluster, 2)
+
+        cluster.shutdown()
 
     def test_rfone_downgradingcl(self):
         self._test_downgrading_cl(
@@ -278,6 +288,8 @@ class ConsistencyTests(unittest.TestCase):
         finally:
             start(2)
             wait_for_up(cluster, 2)
+
+        session.cluster.shutdown()
 
     # TODO: can't be done in this class since we reuse the ccm cluster
     #       instead we should create these elsewhere

@@ -1,4 +1,4 @@
-# Copyright 2013-2014 DataStax, Inc.
+# Copyright 2013-2015 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,17 +13,20 @@
 # limitations under the License.
 
 
-from tests.integration import PROTOCOL_VERSION
+from tests.integration import use_singledc, PROTOCOL_VERSION
 
 try:
     import unittest2 as unittest
 except ImportError:
-    import unittest # noqa
+    import unittest  # noqa
 from cassandra import InvalidRequest
 
 from cassandra.cluster import Cluster
 from cassandra.query import PreparedStatement
 
+
+def setup_module():
+    use_singledc()
 
 class PreparedStatementTests(unittest.TestCase):
 
@@ -97,6 +100,8 @@ class PreparedStatementTests(unittest.TestCase):
         results = session.execute(bound)
         self.assertEqual(results, [('x', 'y', 'z')])
 
+        cluster.shutdown()
+
     def test_missing_primary_key(self):
         """
         Ensure an InvalidRequest is thrown
@@ -114,6 +119,8 @@ class PreparedStatementTests(unittest.TestCase):
         self.assertIsInstance(prepared, PreparedStatement)
         bound = prepared.bind((1,))
         self.assertRaises(InvalidRequest, session.execute, bound)
+
+        cluster.shutdown()
 
     def test_missing_primary_key_dicts(self):
         """
@@ -134,6 +141,8 @@ class PreparedStatementTests(unittest.TestCase):
         bound = prepared.bind({'v': 1})
         self.assertRaises(InvalidRequest, session.execute, bound)
 
+        cluster.shutdown()
+
     def test_too_many_bind_values(self):
         """
         Ensure a ValueError is thrown when attempting to bind too many variables
@@ -149,6 +158,8 @@ class PreparedStatementTests(unittest.TestCase):
 
         self.assertIsInstance(prepared, PreparedStatement)
         self.assertRaises(ValueError, prepared.bind, (1, 2))
+
+        cluster.shutdown()
 
     def test_too_many_bind_values_dicts(self):
         """
@@ -170,6 +181,8 @@ class PreparedStatementTests(unittest.TestCase):
         # also catch too few variables with dicts
         self.assertIsInstance(prepared, PreparedStatement)
         self.assertRaises(KeyError, prepared.bind, {})
+
+        cluster.shutdown()
 
     def test_none_values(self):
         """
@@ -197,6 +210,8 @@ class PreparedStatementTests(unittest.TestCase):
         bound = prepared.bind((1,))
         results = session.execute(bound)
         self.assertEqual(results[0].v, None)
+
+        cluster.shutdown()
 
     def test_none_values_dicts(self):
         """
@@ -226,6 +241,8 @@ class PreparedStatementTests(unittest.TestCase):
         results = session.execute(bound)
         self.assertEqual(results[0].v, None)
 
+        cluster.shutdown()
+
     def test_async_binding(self):
         """
         Ensure None binding over async queries
@@ -253,6 +270,8 @@ class PreparedStatementTests(unittest.TestCase):
         results = future.result()
         self.assertEqual(results[0].v, None)
 
+        cluster.shutdown()
+
     def test_async_binding_dicts(self):
         """
         Ensure None binding over async queries with dict bindings
@@ -279,3 +298,5 @@ class PreparedStatementTests(unittest.TestCase):
         future = session.execute_async(prepared, {'k': 873})
         results = future.result()
         self.assertEqual(results[0].v, None)
+
+        cluster.shutdown()

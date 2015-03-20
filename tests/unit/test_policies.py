@@ -1,4 +1,4 @@
-# Copyright 2013-2014 DataStax, Inc.
+# Copyright 2013-2015 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 try:
     import unittest2 as unittest
 except ImportError:
-    import unittest # noqa
+    import unittest  # noqa
 
 from itertools import islice, cycle
 from mock import Mock
@@ -40,7 +40,7 @@ from cassandra.query import Statement
 from six.moves import xrange
 
 
-class TestLoadBalancingPolicy(unittest.TestCase):
+class LoadBalancingPolicyTest(unittest.TestCase):
     def test_non_implemented(self):
         """
         Code coverage for interface-style base class
@@ -62,7 +62,7 @@ class TestLoadBalancingPolicy(unittest.TestCase):
         self.assertRaises(TypeError, Cluster, load_balancing_policy=RoundRobinPolicy)
 
 
-class TestRoundRobinPolicy(unittest.TestCase):
+class RoundRobinPolicyTest(unittest.TestCase):
 
     def test_basic(self):
         hosts = [0, 1, 2, 3]
@@ -139,21 +139,22 @@ class TestRoundRobinPolicy(unittest.TestCase):
             threads.append(Thread(target=host_down))
 
         # make the GIL switch after every instruction, maximizing
-        # the chace of race conditions
-        if six.PY2:
+        # the chance of race conditions
+        check = six.PY2 or '__pypy__' in sys.builtin_module_names
+        if check:
             original_interval = sys.getcheckinterval()
         else:
             original_interval = sys.getswitchinterval()
 
         try:
-            if six.PY2:
+            if check:
                 sys.setcheckinterval(0)
             else:
                 sys.setswitchinterval(0.0001)
             map(lambda t: t.start(), threads)
             map(lambda t: t.join(), threads)
         finally:
-            if six.PY2:
+            if check:
                 sys.setcheckinterval(original_interval)
             else:
                 sys.setswitchinterval(original_interval)
@@ -202,14 +203,14 @@ class DCAwareRoundRobinPolicyTest(unittest.TestCase):
 
         # allow all of the remote hosts to be used
         policy = DCAwareRoundRobinPolicy("dc1", used_hosts_per_remote_dc=2)
-        policy.populate(Mock(spec=Metadata), hosts)
+        policy.populate(Mock(), hosts)
         qplan = list(policy.make_query_plan())
         self.assertEqual(set(qplan[:2]), local_hosts)
         self.assertEqual(set(qplan[2:]), remote_hosts)
 
         # allow only one of the remote hosts to be used
         policy = DCAwareRoundRobinPolicy("dc1", used_hosts_per_remote_dc=1)
-        policy.populate(Mock(spec=Metadata), hosts)
+        policy.populate(Mock(), hosts)
         qplan = list(policy.make_query_plan())
         self.assertEqual(set(qplan[:2]), local_hosts)
 
@@ -219,7 +220,7 @@ class DCAwareRoundRobinPolicyTest(unittest.TestCase):
 
         # allow no remote hosts to be used
         policy = DCAwareRoundRobinPolicy("dc1", used_hosts_per_remote_dc=0)
-        policy.populate(Mock(spec=Metadata), hosts)
+        policy.populate(Mock(), hosts)
         qplan = list(policy.make_query_plan())
         self.assertEqual(2, len(qplan))
         self.assertEqual(local_hosts, set(qplan))
@@ -228,7 +229,7 @@ class DCAwareRoundRobinPolicyTest(unittest.TestCase):
         policy = DCAwareRoundRobinPolicy("dc1", used_hosts_per_remote_dc=0)
         host = Host("ip1", SimpleConvictionPolicy)
         host.set_location_info("dc1", "rack1")
-        policy.populate(Mock(spec=Metadata), [host])
+        policy.populate(Mock(), [host])
 
         self.assertEqual(policy.distance(host), HostDistance.LOCAL)
 
@@ -242,14 +243,14 @@ class DCAwareRoundRobinPolicyTest(unittest.TestCase):
         self.assertEqual(policy.distance(remote_host), HostDistance.IGNORED)
 
         # make sure the policy has both dcs registered
-        policy.populate(Mock(spec=Metadata), [host, remote_host])
+        policy.populate(Mock(), [host, remote_host])
         self.assertEqual(policy.distance(remote_host), HostDistance.REMOTE)
 
         # since used_hosts_per_remote_dc is set to 1, only the first
         # remote host in dc2 will be REMOTE, the rest are IGNORED
         second_remote_host = Host("ip3", SimpleConvictionPolicy)
         second_remote_host.set_location_info("dc2", "rack1")
-        policy.populate(Mock(spec=Metadata), [host, remote_host, second_remote_host])
+        policy.populate(Mock(), [host, remote_host, second_remote_host])
         distances = set([policy.distance(remote_host), policy.distance(second_remote_host)])
         self.assertEqual(distances, set([HostDistance.REMOTE, HostDistance.IGNORED]))
 
@@ -261,7 +262,7 @@ class DCAwareRoundRobinPolicyTest(unittest.TestCase):
             h.set_location_info("dc2", "rack1")
 
         policy = DCAwareRoundRobinPolicy("dc1", used_hosts_per_remote_dc=1)
-        policy.populate(Mock(spec=Metadata), hosts)
+        policy.populate(Mock(), hosts)
         policy.on_down(hosts[0])
         policy.on_remove(hosts[2])
 
@@ -303,7 +304,7 @@ class DCAwareRoundRobinPolicyTest(unittest.TestCase):
             hosts.append(h)
 
         policy = DCAwareRoundRobinPolicy("dc1", used_hosts_per_remote_dc=1)
-        policy.populate(Mock(spec=Metadata), hosts)
+        policy.populate(Mock(), hosts)
 
         for host in hosts:
             policy.on_down(host)
@@ -321,6 +322,46 @@ class DCAwareRoundRobinPolicyTest(unittest.TestCase):
 
         qplan = list(policy.make_query_plan())
         self.assertEqual(qplan, [])
+
+    def test_default_dc(self):
+        host_local = Host(1, SimpleConvictionPolicy, 'local')
+        host_remote = Host(2, SimpleConvictionPolicy, 'remote')
+        host_none = Host(1, SimpleConvictionPolicy)
+
+        # contact point is '1'
+        cluster = Mock(contact_points=[1])
+
+        # contact DC first
+        policy = DCAwareRoundRobinPolicy()
+        policy.populate(cluster, [host_none])
+        self.assertFalse(policy.local_dc)
+        policy.on_add(host_local)
+        policy.on_add(host_remote)
+        self.assertNotEqual(policy.local_dc, host_remote.datacenter)
+        self.assertEqual(policy.local_dc, host_local.datacenter)
+
+        # contact DC second
+        policy = DCAwareRoundRobinPolicy()
+        policy.populate(cluster, [host_none])
+        self.assertFalse(policy.local_dc)
+        policy.on_add(host_remote)
+        policy.on_add(host_local)
+        self.assertNotEqual(policy.local_dc, host_remote.datacenter)
+        self.assertEqual(policy.local_dc, host_local.datacenter)
+
+        # no DC
+        policy = DCAwareRoundRobinPolicy()
+        policy.populate(cluster, [host_none])
+        self.assertFalse(policy.local_dc)
+        policy.on_add(host_none)
+        self.assertFalse(policy.local_dc)
+
+        # only other DC
+        policy = DCAwareRoundRobinPolicy()
+        policy.populate(cluster, [host_none])
+        self.assertFalse(policy.local_dc)
+        policy.on_add(host_remote)
+        self.assertFalse(policy.local_dc)
 
 
 class TokenAwarePolicyTest(unittest.TestCase):
@@ -342,7 +383,7 @@ class TokenAwarePolicyTest(unittest.TestCase):
         policy.populate(cluster, hosts)
 
         for i in range(4):
-            query = Statement(routing_key=struct.pack('>i', i))
+            query = Statement(routing_key=struct.pack('>i', i), keyspace='keyspace_name')
             qplan = list(policy.make_query_plan(None, query))
 
             replicas = get_replicas(None, struct.pack('>i', i))
@@ -381,7 +422,7 @@ class TokenAwarePolicyTest(unittest.TestCase):
         policy.populate(cluster, hosts)
 
         for i in range(4):
-            query = Statement(routing_key=struct.pack('>i', i))
+            query = Statement(routing_key=struct.pack('>i', i), keyspace='keyspace_name')
             qplan = list(policy.make_query_plan(None, query))
             replicas = get_replicas(None, struct.pack('>i', i))
 
@@ -480,6 +521,61 @@ class TokenAwarePolicyTest(unittest.TestCase):
         qplan = list(policy.make_query_plan())
         self.assertEqual(qplan, [])
 
+    def test_statement_keyspace(self):
+        hosts = [Host(str(i), SimpleConvictionPolicy) for i in range(4)]
+        for host in hosts:
+            host.set_up()
+
+        cluster = Mock(spec=Cluster)
+        cluster.metadata = Mock(spec=Metadata)
+        replicas = hosts[2:]
+        cluster.metadata.get_replicas.return_value = replicas
+
+        child_policy = Mock()
+        child_policy.make_query_plan.return_value = hosts
+        child_policy.distance.return_value = HostDistance.LOCAL
+
+        policy = TokenAwarePolicy(child_policy)
+        policy.populate(cluster, hosts)
+
+        # no keyspace, child policy is called
+        keyspace = None
+        routing_key = 'routing_key'
+        query = Statement(routing_key=routing_key)
+        qplan = list(policy.make_query_plan(keyspace, query))
+        self.assertEqual(hosts, qplan)
+        self.assertEqual(cluster.metadata.get_replicas.call_count, 0)
+        child_policy.make_query_plan.assert_called_once_with(keyspace, query)
+
+        # working keyspace, no statement
+        cluster.metadata.get_replicas.reset_mock()
+        keyspace = 'working_keyspace'
+        routing_key = 'routing_key'
+        query = Statement(routing_key=routing_key)
+        qplan = list(policy.make_query_plan(keyspace, query))
+        self.assertEqual(replicas + hosts[:2], qplan)
+        cluster.metadata.get_replicas.assert_called_with(keyspace, routing_key)
+
+        # statement keyspace, no working
+        cluster.metadata.get_replicas.reset_mock()
+        working_keyspace = None
+        statement_keyspace = 'statement_keyspace'
+        routing_key = 'routing_key'
+        query = Statement(routing_key=routing_key, keyspace=statement_keyspace)
+        qplan = list(policy.make_query_plan(working_keyspace, query))
+        self.assertEqual(replicas + hosts[:2], qplan)
+        cluster.metadata.get_replicas.assert_called_with(statement_keyspace, routing_key)
+
+        # both keyspaces set, statement keyspace used for routing
+        cluster.metadata.get_replicas.reset_mock()
+        working_keyspace = 'working_keyspace'
+        statement_keyspace = 'statement_keyspace'
+        routing_key = 'routing_key'
+        query = Statement(routing_key=routing_key, keyspace=statement_keyspace)
+        qplan = list(policy.make_query_plan(working_keyspace, query))
+        self.assertEqual(replicas + hosts[:2], qplan)
+        cluster.metadata.get_replicas.assert_called_with(statement_keyspace, routing_key)
+
 
 class ConvictionPolicyTest(unittest.TestCase):
     def test_not_implemented(self):
@@ -570,6 +666,7 @@ class ExponentialReconnectionPolicyTest(unittest.TestCase):
                 self.assertEqual(delay, 100)
 
 ONE = ConsistencyLevel.ONE
+
 
 class RetryPolicyTest(unittest.TestCase):
 

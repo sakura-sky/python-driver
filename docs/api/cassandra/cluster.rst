@@ -5,6 +5,8 @@
 
 .. autoclass:: Cluster ([contact_points=('127.0.0.1',)][, port=9042][, executor_threads=2], **attr_kwargs)
 
+   Any of the mutable Cluster attributes may be set as keyword arguments to the constructor.
+
    .. autoattribute:: cql_version
 
    .. autoattribute:: protocol_version
@@ -39,9 +41,17 @@
 
    .. autoattribute:: control_connection_timeout
 
+   .. autoattribute:: idle_heartbeat_interval
+
+   .. autoattribute:: schema_event_refresh_window
+
+   .. autoattribute:: topology_event_refresh_window
+
    .. automethod:: connect
 
    .. automethod:: shutdown
+
+   .. automethod:: register_user_type
 
    .. automethod:: register_listener
 
@@ -55,6 +65,13 @@
 
    .. automethod:: set_max_connections_per_host
 
+   .. automethod:: refresh_schema
+
+   .. automethod:: refresh_nodes
+
+   .. automethod:: set_meta_refresh_enabled
+
+
 .. autoclass:: Session ()
 
    .. autoattribute:: default_timeout
@@ -62,6 +79,10 @@
    .. autoattribute:: row_factory
 
    .. autoattribute:: default_fetch_size
+
+   .. autoattribute:: use_client_timestamp
+
+   .. autoattribute:: encoder
 
    .. automethod:: execute(statement[, parameters][, timeout][, trace])
 
@@ -98,3 +119,5 @@
 
 .. autoexception:: NoHostAvailable ()
    :members:
+
+.. autoexception:: UserTypeDoesNotExist ()

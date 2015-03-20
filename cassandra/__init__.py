@@ -1,4 +1,4 @@
-# Copyright 2013-2014 DataStax, Inc.
+# Copyright 2013-2015 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ class NullHandler(logging.Handler):
 logging.getLogger('cassandra').addHandler(NullHandler())
 
 
-__version_info__ = (2, 0, 1, 'post')
+__version_info__ = (2, 1, 4, 'post')
 __version__ = '.'.join(map(str, __version_info__))
 
 
@@ -122,6 +122,10 @@ ConsistencyLevel.name_to_value = {
 }
 
 
+def consistency_value_to_name(value):
+    return ConsistencyLevel.value_to_name[value] if value is not None else "Not Set"
+
+
 class Unavailable(Exception):
     """
     There were not enough live replicas to satisfy the requested consistency
@@ -138,11 +142,14 @@ class Unavailable(Exception):
     alive_replicas = None
     """ The number of replicas that were actually alive """
 
-    def __init__(self, message, consistency=None, required_replicas=None, alive_replicas=None):
-        Exception.__init__(self, message)
+    def __init__(self, summary_message, consistency=None, required_replicas=None, alive_replicas=None):
         self.consistency = consistency
         self.required_replicas = required_replicas
         self.alive_replicas = alive_replicas
+        Exception.__init__(self, summary_message + ' info=' +
+                           repr({'consistency': consistency_value_to_name(consistency),
+                                 'required_replicas': required_replicas,
+                                 'alive_replicas': alive_replicas}))
 
 
 class Timeout(Exception):
@@ -162,16 +169,24 @@ class Timeout(Exception):
     the operation
     """
 
-    def __init__(self, message, consistency=None, required_responses=None, received_responses=None):
-        Exception.__init__(self, message)
+    def __init__(self, summary_message, consistency=None, required_responses=None, received_responses=None):
         self.consistency = consistency
         self.required_responses = required_responses
         self.received_responses = received_responses
+        Exception.__init__(self, summary_message + ' info=' +
+                           repr({'consistency': consistency_value_to_name(consistency),
+                                 'required_responses': required_responses,
+                                 'received_responses': received_responses}))
 
 
 class ReadTimeout(Timeout):
     """
     A subclass of :exc:`Timeout` for read operations.
+
+    This indicates that the replicas failed to respond to the coordinator
+    node before the configured timeout. This timeout is configured in
+    ``cassandra.yaml`` with the ``read_request_timeout_in_ms``
+    and ``range_request_timeout_in_ms`` options.
     """
 
     data_retrieved = None
@@ -189,6 +204,11 @@ class ReadTimeout(Timeout):
 class WriteTimeout(Timeout):
     """
     A subclass of :exc:`Timeout` for write operations.
+
+    This indicates that the replicas failed to respond to the coordinator
+    node before the configured timeout. This timeout is configured in
+    ``cassandra.yaml`` with the ``write_request_timeout_in_ms``
+    option.
     """
 
     write_type = None

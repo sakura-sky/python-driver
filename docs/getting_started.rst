@@ -40,7 +40,7 @@ behavior in some other way, this is the place to do it:
 .. code-block:: python
 
     from cassandra.cluster import Cluster
-    from cassandra.polices import DCAwareRoundRobinPolicy
+    from cassandra.policies import DCAwareRoundRobinPolicy
 
     cluster = Cluster(
         ['10.1.1.3', '10.1.1.4', '10.1.1.5'],
@@ -68,7 +68,7 @@ which sets the default keyspace for all queries made through that :class:`~.Sess
     session = cluster.connect('mykeyspace')
 
 
-You can always change a Sesssion's keyspace using :meth:`~.Session.set_keyspace` or
+You can always change a Session's keyspace using :meth:`~.Session.set_keyspace` or
 by executing a ``USE <keyspace>`` query:
 
 .. code-block:: python
@@ -114,7 +114,7 @@ examples are equivalent:
 .. code-block:: python
 
     rows = session.execute('SELECT name, age, email FROM users')
-    for row in row:
+    for row in rows:
         print row[0], row[1], row[2]
 
 If you prefer another result format, such as a ``dict`` per row, you
@@ -137,7 +137,7 @@ when you execute:
         """
         INSERT INTO users (name, credits, user_id)
         VALUES (%s, %s, %s)
-        """
+        """,
         ("John O'Reilly", 42, uuid.uuid1())
     )
 
@@ -189,6 +189,8 @@ in the above example.
 Only data values should be supplied this way.  Other items, such as keyspaces,
 table names, and column names should be set ahead of time (typically using
 normal string formatting).
+
+.. _type-conversions:
 
 Type Conversions
 ^^^^^^^^^^^^^^^^
@@ -360,9 +362,7 @@ handles re-preparing against new nodes and restarted nodes when necessary.
 
 Note that the placeholders for prepared statements are ``?`` characters.  This
 is different than for simple, non-prepared statements (although future versions
-of the driver may use the same placeholders for both).  Cassandra 2.0 added
-support for named placeholders; the 1.0 version of the driver does not support
-them, but the 2.0 version will.
+of the driver may use the same placeholders for both).
 
 Setting a Consistency Level with Prepared Statements
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -385,7 +385,7 @@ prepared statement:
     user2 = session.execute(user_lookup_stmt, [user_id2])[0]
 
 The second option is to create a :class:`~.BoundStatement` from the
-:class:`~.PreparedStatement` and binding paramaters and set a consistency
+:class:`~.PreparedStatement` and binding parameters and set a consistency
 level on that:
 
 .. code-block:: python

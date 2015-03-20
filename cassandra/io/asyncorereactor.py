@@ -1,4 +1,4 @@
-# Copyright 2013-2014 DataStax, Inc.
+# Copyright 2013-2015 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import atexit
 from collections import deque
 from functools import partial
@@ -22,7 +21,6 @@ import sys
 from threading import Event, Lock, Thread
 import weakref
 
-from six import BytesIO
 from six.moves import range
 
 from errno import EALREADY, EINPROGRESS, EWOULDBLOCK, EINVAL, EISCONN, errorcode
@@ -42,7 +40,6 @@ from cassandra import OperationTimedOut
 from cassandra.connection import (Connection, ConnectionShutdown,
                                   ConnectionException, NONBLOCKING)
 from cassandra.protocol import RegisterMessage
-from cassandra.marshal import int32_unpack
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +56,7 @@ def _cleanup(loop_weakref):
 class AsyncoreLoop(object):
 
     def __init__(self):
+        self._pid = os.getpid()
         self._loop_lock = Lock()
         self._started = False
         self._shutdown = False
@@ -135,11 +133,28 @@ class AsyncoreConnection(Connection, asyncore.dispatcher):
     module in the Python standard library for its event loop.
     """
 
-    _loop = AsyncoreLoop()
+    _loop = None
 
     _total_reqd_bytes = 0
     _writable = False
     _readable = False
+
+    @classmethod
+    def initialize_reactor(cls):
+        if not cls._loop:
+            cls._loop = AsyncoreLoop()
+        else:
+            current_pid = os.getpid()
+            if cls._loop._pid != current_pid:
+                log.debug("Detected fork, clearing and reinitializing reactor state")
+                cls.handle_fork()
+                cls._loop = AsyncoreLoop()
+
+    @classmethod
+    def handle_fork(cls):
+        if cls._loop:
+            cls._loop._cleanup()
+            cls._loop = None
 
     @classmethod
     def factory(cls, *args, **kwargs):
@@ -159,7 +174,6 @@ class AsyncoreConnection(Connection, asyncore.dispatcher):
         asyncore.dispatcher.__init__(self)
 
         self.connected_event = Event()
-        self._iobuf = BytesIO()
 
         self._callbacks = {}
         self.deque = deque()
@@ -167,8 +181,19 @@ class AsyncoreConnection(Connection, asyncore.dispatcher):
 
         self._loop.connection_created(self)
 
-        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.connect((self.host, self.port))
+        sockerr = None
+        addresses = socket.getaddrinfo(self.host, self.port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        for (af, socktype, proto, canonname, sockaddr) in addresses:
+            try:
+                self.create_socket(af, socktype)
+                self.connect(sockaddr)
+                sockerr = None
+                break
+            except socket.error as err:
+                sockerr = err
+        if sockerr:
+            raise socket.error(sockerr.errno, "Tried connecting to %s. Last error: %s" % ([a[4] for a in addresses], sockerr.strerror))
+
         self.add_channel()
 
         if self.sockopts:
@@ -207,14 +232,14 @@ class AsyncoreConnection(Connection, asyncore.dispatcher):
         self.socket.settimeout(1.0)
         err = self.socket.connect_ex(address)
         if err in (EINPROGRESS, EALREADY, EWOULDBLOCK) \
-        or err == EINVAL and os.name in ('nt', 'ce'):
+           or err == EINVAL and os.name in ('nt', 'ce'):
             raise ConnectionException("Timed out connecting to %s" % (address[0]))
         if err in (0, EISCONN):
             self.addr = address
             self.socket.setblocking(0)
             self.handle_connect_event()
         else:
-            raise socket.error(err, errorcode[err])
+            raise socket.error(err, os.strerror(err))
 
     def close(self):
         with self.lock:
@@ -243,17 +268,17 @@ class AsyncoreConnection(Connection, asyncore.dispatcher):
         self.defunct(sys.exc_info()[1])
 
     def handle_close(self):
-        log.debug("connection (%s) to %s closed by server", id(self), self.host)
+        log.debug("Connection %s closed by server", self)
         self.close()
 
     def handle_write(self):
         while True:
-            try:
-                with self.deque_lock:
+            with self.deque_lock:
+                try:
                     next_msg = self.deque.popleft()
-            except IndexError:
-                self._writable = False
-                return
+                except IndexError:
+                    self._writable = False
+                    return
 
             try:
                 sent = self.send(next_msg)
@@ -289,38 +314,7 @@ class AsyncoreConnection(Connection, asyncore.dispatcher):
                 return
 
         if self._iobuf.tell():
-            while True:
-                pos = self._iobuf.tell()
-                if pos < 8 or (self._total_reqd_bytes > 0 and pos < self._total_reqd_bytes):
-                    # we don't have a complete header yet or we
-                    # already saw a header, but we don't have a
-                    # complete message yet
-                    break
-                else:
-                    # have enough for header, read body len from header
-                    self._iobuf.seek(4)
-                    body_len = int32_unpack(self._iobuf.read(4))
-
-                    # seek to end to get length of current buffer
-                    self._iobuf.seek(0, os.SEEK_END)
-                    pos = self._iobuf.tell()
-
-                    if pos >= body_len + 8:
-                        # read message header and body
-                        self._iobuf.seek(0)
-                        msg = self._iobuf.read(8 + body_len)
-
-                        # leave leftover in current buffer
-                        leftover = self._iobuf.read()
-                        self._iobuf = BytesIO()
-                        self._iobuf.write(leftover)
-
-                        self._total_reqd_bytes = 0
-                        self.process_msg(msg, body_len)
-                    else:
-                        self._total_reqd_bytes = body_len + 8
-                        break
-
+            self.process_io_buffer()
             if not self._callbacks and not self.is_control_connection:
                 self._readable = False
 
@@ -335,8 +329,7 @@ class AsyncoreConnection(Connection, asyncore.dispatcher):
 
         with self.deque_lock:
             self.deque.extend(chunks)
-
-        self._writable = True
+            self._writable = True
 
     def writable(self):
         return self._writable

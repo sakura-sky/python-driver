@@ -1,4 +1,4 @@
-# Copyright 2013-2014 DataStax, Inc.
+# Copyright 2013-2015 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import defaultdict
+from __future__ import absolute_import  # to enable import io from stdlib
+from collections import defaultdict, deque
 import errno
 from functools import wraps, partial
+import io
 import logging
+import os
 import sys
-from threading import Event, RLock
+from threading import Thread, Event, RLock
 import time
 
 if 'gevent.monkey' in sys.modules:
@@ -29,13 +32,13 @@ import six
 from six.moves import range
 
 from cassandra import ConsistencyLevel, AuthenticationFailed, OperationTimedOut
-from cassandra.marshal import int32_pack, header_unpack
+from cassandra.marshal import int32_pack, header_unpack, v3_header_unpack, int32_unpack
 from cassandra.protocol import (ReadyMessage, AuthenticateMessage, OptionsMessage,
                                 StartupMessage, ErrorMessage, CredentialsMessage,
                                 QueryMessage, ResultMessage, decode_response,
                                 InvalidRequestException, SupportedMessage,
                                 AuthResponseMessage, AuthChallengeMessage,
-                                AuthSuccessMessage)
+                                AuthSuccessMessage, ProtocolException)
 from cassandra.util import OrderedDict
 
 
@@ -78,8 +81,6 @@ else:
         return snappy.decompress(byts)
     locally_supported_compressions['snappy'] = (snappy.compress, decompress)
 
-
-MAX_STREAM_PER_CONNECTION = 127
 
 PROTOCOL_VERSION_MASK = 0x7f
 
@@ -152,16 +153,34 @@ class Connection(object):
 
     ssl_options = None
     last_error = None
+
+    # The current number of operations that are in flight. More precisely,
+    # the number of request IDs that are currently in use.
     in_flight = 0
+
+    # A set of available request IDs.  When using the v3 protocol or higher,
+    # this will not initially include all request IDs in order to save memory,
+    # but the set will grow if it is exhausted.
+    request_ids = None
+
+    # Tracks the highest used request ID in order to help with growing the
+    # request_ids set
+    highest_request_id = 0
+
     is_defunct = False
     is_closed = False
     lock = None
+    user_type_map = None
+
+    msg_received = False
 
     is_control_connection = False
+    _iobuf = None
 
     def __init__(self, host='127.0.0.1', port=9042, authenticator=None,
                  ssl_options=None, sockopts=None, compression=True,
-                 cql_version=None, protocol_version=2, is_control_connection=False):
+                 cql_version=None, protocol_version=2, is_control_connection=False,
+                 user_type_map=None):
         self.host = host
         self.port = port
         self.authenticator = authenticator
@@ -171,13 +190,54 @@ class Connection(object):
         self.cql_version = cql_version
         self.protocol_version = protocol_version
         self.is_control_connection = is_control_connection
+        self.user_type_map = user_type_map
         self._push_watchers = defaultdict(set)
+        self._iobuf = io.BytesIO()
+        if protocol_version >= 3:
+            self._header_unpack = v3_header_unpack
+            self._header_length = 5
+            self.max_request_id = (2 ** 15) - 1
+            # Don't fill the deque with 2**15 items right away. Start with 300 and add
+            # more if needed.
+            self.request_ids = deque(range(300))
+            self.highest_request_id = 299
+        else:
+            self._header_unpack = header_unpack
+            self._header_length = 4
+            self.max_request_id = (2 ** 7) - 1
+            self.request_ids = deque(range(self.max_request_id + 1))
+            self.highest_request_id = self.max_request_id
 
-        self._id_queue = Queue(MAX_STREAM_PER_CONNECTION)
-        for i in range(MAX_STREAM_PER_CONNECTION):
-            self._id_queue.put_nowait(i)
+        # 0         8        16        24        32         40
+        # +---------+---------+---------+---------+---------+
+        # | version |  flags  |      stream       | opcode  |
+        # +---------+---------+---------+---------+---------+
+        # |                length                 |
+        # +---------+---------+---------+---------+
+        # |                                       |
+        # .            ...  body ...              .
+        # .                                       .
+        # .                                       .
+        # +----------------------------------------
+        self._full_header_length = self._header_length + 4
 
         self.lock = RLock()
+
+    @classmethod
+    def initialize_reactor(self):
+        """
+        Called once by Cluster.connect().  This should be used by implementations
+        to set up any resources that will be shared across connections.
+        """
+        pass
+
+    @classmethod
+    def handle_fork(self):
+        """
+        Called after a forking.  This should cleanup any remaining reactor state
+        from the parent process.
+        """
+        pass
 
     def close(self):
         raise NotImplementedError()
@@ -210,6 +270,18 @@ class Connection(object):
                             "failed connection (%s) to host %s:",
                             id(self), self.host, exc_info=True)
 
+    def get_request_id(self):
+        """
+        This must be called while self.lock is held.
+        """
+        try:
+            return self.request_ids.popleft()
+        except IndexError:
+            self.highest_request_id += 1
+            # in_flight checks should guarantee this
+            assert self.highest_request_id <= self.max_request_id
+            return self.highest_request_id
+
     def handle_pushed(self, response):
         log.debug("Message pushed from server: %r", response)
         for cb in self._push_watchers.get(response.event_type, []):
@@ -218,20 +290,11 @@ class Connection(object):
             except Exception:
                 log.exception("Pushed event handler errored, ignoring:")
 
-    def send_msg(self, msg, cb, wait_for_id=False):
+    def send_msg(self, msg, request_id, cb):
         if self.is_defunct:
             raise ConnectionShutdown("Connection to %s is defunct" % self.host)
         elif self.is_closed:
             raise ConnectionShutdown("Connection to %s is closed" % self.host)
-
-        if not wait_for_id:
-            try:
-                request_id = self._id_queue.get_nowait()
-            except Empty:
-                raise ConnectionBusy(
-                    "Connection to %s is at the max number of requests" % self.host)
-        else:
-            request_id = self._id_queue.get()
 
         self._callbacks[request_id] = cb
         self.push(msg.to_binary(request_id, self.protocol_version, compression=self.compressor))
@@ -241,21 +304,33 @@ class Connection(object):
         return self.wait_for_responses(msg, timeout=timeout)[0]
 
     def wait_for_responses(self, *msgs, **kwargs):
+        """
+        Returns a list of (success, response) tuples.  If success
+        is False, response will be an Exception.  Otherwise, response
+        will be the normal query response.
+
+        If fail_on_error was left as True and one of the requests
+        failed, the corresponding Exception will be raised.
+        """
         if self.is_closed or self.is_defunct:
             raise ConnectionShutdown("Connection %s is already closed" % (self, ))
         timeout = kwargs.get('timeout')
-        waiter = ResponseWaiter(self, len(msgs))
+        fail_on_error = kwargs.get('fail_on_error', True)
+        waiter = ResponseWaiter(self, len(msgs), fail_on_error)
 
         # busy wait for sufficient space on the connection
         messages_sent = 0
         while True:
             needed = len(msgs) - messages_sent
             with self.lock:
-                available = min(needed, MAX_STREAM_PER_CONNECTION - self.in_flight)
+                available = min(needed, self.max_request_id - self.in_flight)
+                request_ids = [self.get_request_id() for _ in range(available)]
                 self.in_flight += available
 
-            for i in range(messages_sent, messages_sent + available):
-                self.send_msg(msgs[i], partial(waiter.got_response, index=i), wait_for_id=True)
+            for i, request_id in enumerate(request_ids):
+                self.send_msg(msgs[messages_sent + i],
+                              request_id,
+                              partial(waiter.got_response, index=messages_sent + i))
             messages_sent += available
 
             if messages_sent == len(msgs):
@@ -285,14 +360,50 @@ class Connection(object):
         self.is_control_connection = False
         self._push_watchers = {}
 
+    def process_io_buffer(self):
+        while True:
+            pos = self._iobuf.tell()
+            if pos < self._full_header_length or (self._total_reqd_bytes > 0 and pos < self._total_reqd_bytes):
+                # we don't have a complete header yet or we
+                # already saw a header, but we don't have a
+                # complete message yet
+                return
+            else:
+                # have enough for header, read body len from header
+                self._iobuf.seek(self._header_length)
+                body_len = int32_unpack(self._iobuf.read(4))
+
+                # seek to end to get length of current buffer
+                self._iobuf.seek(0, os.SEEK_END)
+                pos = self._iobuf.tell()
+
+                if pos >= body_len + self._full_header_length:
+                    # read message header and body
+                    self._iobuf.seek(0)
+                    msg = self._iobuf.read(self._full_header_length + body_len)
+
+                    # leave leftover in current buffer
+                    leftover = self._iobuf.read()
+                    self._iobuf = io.BytesIO()
+                    self._iobuf.write(leftover)
+
+                    self._total_reqd_bytes = 0
+                    self.process_msg(msg, body_len)
+                else:
+                    self._total_reqd_bytes = body_len + self._full_header_length
+                    return
+
     @defunct_on_error
     def process_msg(self, msg, body_len):
-        version, flags, stream_id, opcode = header_unpack(msg[:4])
+        version, flags, stream_id, opcode = self._header_unpack(msg[:self._header_length])
         if stream_id < 0:
             callback = None
         else:
             callback = self._callbacks.pop(stream_id, None)
-            self._id_queue.put_nowait(stream_id)
+            with self.lock:
+                self.request_ids.append(stream_id)
+
+        self.msg_received = True
 
         body = None
         try:
@@ -310,13 +421,14 @@ class Connection(object):
                     % (opcode, stream_id))
 
             if body_len > 0:
-                body = msg[8:]
+                body = msg[self._full_header_length:]
             elif body_len == 0:
                 body = six.binary_type()
             else:
                 raise ProtocolError("Got negative body length: %r" % body_len)
 
-            response = decode_response(stream_id, flags, opcode, body, self.decompressor)
+            response = decode_response(given_version, self.user_type_map, stream_id,
+                                       flags, opcode, body, self.decompressor)
         except Exception as exc:
             log.exception("Error decoding response from Cassandra. "
                           "opcode: %04x; message contents: %r", opcode, msg)
@@ -326,10 +438,14 @@ class Connection(object):
             return
 
         try:
-            if stream_id < 0:
+            if stream_id >= 0:
+                if isinstance(response, ProtocolException):
+                    log.error("Closing connection %s due to protocol error: %s", self, response.summary_msg())
+                    self.defunct(response)
+                if callback is not None:
+                    callback(response)
+            else:
                 self.handle_pushed(response)
-            elif callback is not None:
-                callback(response)
         except Exception:
             log.exception("Callback handler errored, ignoring:")
 
@@ -344,7 +460,7 @@ class Connection(object):
             self._send_startup_message()
         else:
             log.debug("Sending initial options message for new connection (%s) to %s", id(self), self.host)
-            self.send_msg(OptionsMessage(), self._handle_options_response)
+            self.send_msg(OptionsMessage(), self.get_request_id(), self._handle_options_response)
 
     @defunct_on_error
     def _handle_options_response(self, options_response):
@@ -355,10 +471,10 @@ class Connection(object):
             if isinstance(options_response, ConnectionException):
                 raise options_response
             else:
-                log.error("Did not get expected SupportedMessage response; " \
+                log.error("Did not get expected SupportedMessage response; "
                           "instead, got: %s", options_response)
-                raise ConnectionException("Did not get expected SupportedMessage " \
-                                          "response; instead, got: %s" \
+                raise ConnectionException("Did not get expected SupportedMessage "
+                                          "response; instead, got: %s"
                                           % (options_response,))
 
         log.debug("Received options response on new connection (%s) from %s",
@@ -411,11 +527,13 @@ class Connection(object):
 
     @defunct_on_error
     def _send_startup_message(self, compression=None):
+        log.debug("Sending StartupMessage on %s", self)
         opts = {}
         if compression:
             opts['COMPRESSION'] = compression
         sm = StartupMessage(cqlversion=self.cql_version, options=opts)
-        self.send_msg(sm, cb=self._handle_startup_response)
+        self.send_msg(sm, self.get_request_id(), cb=self._handle_startup_response)
+        log.debug("Sent StartupMessage on %s", self)
 
     @defunct_on_error
     def _handle_startup_response(self, startup_response, did_authenticate=False):
@@ -439,12 +557,12 @@ class Connection(object):
                 log.debug("Sending credentials-based auth response on %s", self)
                 cm = CredentialsMessage(creds=self.authenticator)
                 callback = partial(self._handle_startup_response, did_authenticate=True)
-                self.send_msg(cm, cb=callback)
+                self.send_msg(cm, self.get_request_id(), cb=callback)
             else:
                 log.debug("Sending SASL-based auth response on %s", self)
                 initial_response = self.authenticator.initial_response()
-                initial_response = "" if initial_response is None else initial_response.encode('utf-8')
-                self.send_msg(AuthResponseMessage(initial_response), self._handle_auth_response)
+                initial_response = "" if initial_response is None else initial_response
+                self.send_msg(AuthResponseMessage(initial_response), self.get_request_id(), self._handle_auth_response)
         elif isinstance(startup_response, ErrorMessage):
             log.debug("Received ErrorMessage on new connection (%s) from %s: %s",
                       id(self), self.host, startup_response.summary_msg())
@@ -479,7 +597,7 @@ class Connection(object):
             response = self.authenticator.evaluate_challenge(auth_response.challenge)
             msg = AuthResponseMessage("" if response is None else response)
             log.debug("Responding to auth challenge on %s", self)
-            self.send_msg(msg, self._handle_auth_response)
+            self.send_msg(msg, self.get_request_id(), self._handle_auth_response)
         elif isinstance(auth_response, ErrorMessage):
             log.debug("Received ErrorMessage on new connection (%s) from %s: %s",
                       id(self), self.host, auth_response.summary_msg())
@@ -543,7 +661,28 @@ class Connection(object):
                 callback(self, self.defunct(ConnectionException(
                     "Problem while setting keyspace: %r" % (result,), self.host)))
 
-        self.send_msg(query, process_result, wait_for_id=True)
+        request_id = None
+        # we use a busy wait on the lock here because:
+        # - we'll only spin if the connection is at max capacity, which is very
+        #   unlikely for a set_keyspace call
+        # - it allows us to avoid signaling a condition every time a request completes
+        while True:
+            with self.lock:
+                if self.in_flight < self.max_request_id:
+                    request_id = self.get_request_id()
+                    self.in_flight += 1
+                    break
+
+            time.sleep(0.001)
+
+        self.send_msg(query, request_id, process_result)
+
+    @property
+    def is_idle(self):
+        return not self.msg_received
+
+    def reset_idle(self):
+        self.msg_received = False
 
     def __str__(self):
         status = ""
@@ -558,9 +697,10 @@ class Connection(object):
 
 class ResponseWaiter(object):
 
-    def __init__(self, connection, num_responses):
+    def __init__(self, connection, num_responses, fail_on_error):
         self.connection = connection
         self.pending = num_responses
+        self.fail_on_error = fail_on_error
         self.error = None
         self.responses = [None] * num_responses
         self.event = Event()
@@ -569,15 +709,33 @@ class ResponseWaiter(object):
         with self.connection.lock:
             self.connection.in_flight -= 1
         if isinstance(response, Exception):
-            self.error = response
-            self.event.set()
-        else:
-            self.responses[index] = response
-            self.pending -= 1
-            if not self.pending:
+            if hasattr(response, 'to_exception'):
+                response = response.to_exception()
+            if self.fail_on_error:
+                self.error = response
                 self.event.set()
+            else:
+                self.responses[index] = (False, response)
+        else:
+            if not self.fail_on_error:
+                self.responses[index] = (True, response)
+            else:
+                self.responses[index] = response
+
+        self.pending -= 1
+        if not self.pending:
+            self.event.set()
 
     def deliver(self, timeout=None):
+        """
+        If fail_on_error was set to False, a list of (success, response)
+        tuples will be returned.  If success is False, response will be
+        an Exception.  Otherwise, response will be the normal query response.
+
+        If fail_on_error was left as True and one of the requests
+        failed, the corresponding Exception will be raised. Otherwise,
+        the normal response will be returned.
+        """
         self.event.wait(timeout)
         if self.error:
             raise self.error
@@ -585,3 +743,114 @@ class ResponseWaiter(object):
             raise OperationTimedOut()
         else:
             return self.responses
+
+
+class HeartbeatFuture(object):
+    def __init__(self, connection, owner):
+        self._exception = None
+        self._event = Event()
+        self.connection = connection
+        self.owner = owner
+        log.debug("Sending options message heartbeat on idle connection (%s) %s",
+                  id(connection), connection.host)
+        with connection.lock:
+            if connection.in_flight < connection.max_request_id:
+                connection.in_flight += 1
+                connection.send_msg(OptionsMessage(), connection.get_request_id(), self._options_callback)
+            else:
+                self._exception = Exception("Failed to send heartbeat because connection 'in_flight' exceeds threshold")
+                self._event.set()
+
+    def wait(self, timeout):
+        self._event.wait(timeout)
+        if self._event.is_set():
+            if self._exception:
+                raise self._exception
+        else:
+            raise OperationTimedOut()
+
+    def _options_callback(self, response):
+        if not isinstance(response, SupportedMessage):
+            if isinstance(response, ConnectionException):
+                self._exception = response
+            else:
+                self._exception = ConnectionException("Received unexpected response to OptionsMessage: %s"
+                                                      % (response,))
+
+        log.debug("Received options response on connection (%s) from %s",
+                  id(self.connection), self.connection.host)
+        self._event.set()
+
+
+class ConnectionHeartbeat(Thread):
+
+    def __init__(self, interval_sec, get_connection_holders):
+        Thread.__init__(self, name="Connection heartbeat")
+        self._interval = interval_sec
+        self._get_connection_holders = get_connection_holders
+        self._shutdown_event = Event()
+        self.daemon = True
+        self.start()
+
+    class ShutdownException(Exception):
+        pass
+
+    def run(self):
+        self._shutdown_event.wait(self._interval)
+        while not self._shutdown_event.is_set():
+            start_time = time.time()
+
+            futures = []
+            failed_connections = []
+            try:
+                for connections, owner in [(o.get_connections(), o) for o in self._get_connection_holders()]:
+                    for connection in connections:
+                        self._raise_if_stopped()
+                        if not (connection.is_defunct or connection.is_closed):
+                            if connection.is_idle:
+                                try:
+                                    futures.append(HeartbeatFuture(connection, owner))
+                                except Exception:
+                                    log.warning("Failed sending heartbeat message on connection (%s) to %s",
+                                                id(connection), connection.host, exc_info=True)
+                                    failed_connections.append((connection, owner))
+                            else:
+                                connection.reset_idle()
+                        else:
+                            # make sure the owner sees this defunt/closed connection
+                            owner.return_connection(connection)
+                    self._raise_if_stopped()
+
+                for f in futures:
+                    self._raise_if_stopped()
+                    connection = f.connection
+                    try:
+                        f.wait(self._interval)
+                        # TODO: move this, along with connection locks in pool, down into Connection
+                        with connection.lock:
+                            connection.in_flight -= 1
+                        connection.reset_idle()
+                    except Exception:
+                        log.warning("Heartbeat failed for connection (%s) to %s",
+                                    id(connection), connection.host, exc_info=True)
+                        failed_connections.append((f.connection, f.owner))
+
+                for connection, owner in failed_connections:
+                    self._raise_if_stopped()
+                    connection.defunct(Exception('Connection heartbeat failure'))
+                    owner.return_connection(connection)
+            except self.ShutdownException:
+                pass
+            except Exception:
+                log.error("Failed connection heartbeat", exc_info=True)
+
+            elapsed = time.time() - start_time
+            self._shutdown_event.wait(max(self._interval - elapsed, 0.01))
+
+    def stop(self):
+        self._shutdown_event.set()
+        self.join()
+
+    def _raise_if_stopped(self):
+        if self._shutdown_event.is_set():
+            raise self.ShutdownException()

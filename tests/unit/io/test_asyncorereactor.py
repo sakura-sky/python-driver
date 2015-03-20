@@ -1,4 +1,4 @@
-# Copyright 2013-2014 DataStax, Inc.
+# Copyright 2013-2015 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import sys
 import six
 
 try:
@@ -30,22 +31,28 @@ from mock import patch, Mock
 
 from cassandra.connection import (HEADER_DIRECTION_TO_CLIENT,
                                   ConnectionException)
-
+from cassandra.io.asyncorereactor import AsyncoreConnection
 from cassandra.protocol import (write_stringmultimap, write_int, write_string,
                                 SupportedMessage, ReadyMessage, ServerError)
 from cassandra.marshal import uint8_pack, uint32_pack, int32_pack
 
-from cassandra.io.asyncorereactor import AsyncoreConnection
+from tests import is_monkey_patched
 
 
 class AsyncoreConnectionTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        if is_monkey_patched():
+            raise unittest.SkipTest("monkey-patching detected")
+        AsyncoreConnection.initialize_reactor()
         cls.socket_patcher = patch('socket.socket', spec=socket.socket)
         cls.mock_socket = cls.socket_patcher.start()
         cls.mock_socket().connect_ex.return_value = 0
         cls.mock_socket().getsockopt.return_value = 0
+        cls.mock_socket().fileno.return_value = 100
+
+        AsyncoreConnection.add_channel = lambda *args, **kwargs: None
 
     @classmethod
     def tearDownClass(cls):

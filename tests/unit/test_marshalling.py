@@ -1,4 +1,4 @@
-# Copyright 2013-2014 DataStax, Inc.
+# Copyright 2013-2015 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,17 +19,12 @@ except ImportError:
     import unittest  # noqa
 
 import platform
-from datetime import datetime
+from datetime import datetime, date
 from decimal import Decimal
 from uuid import UUID
 
-try:
-    from blist import sortedset
-except ImportError:
-    sortedset = set
-
-from cassandra.cqltypes import lookup_casstype
-from cassandra.util import OrderedDict
+from cassandra.cqltypes import lookup_casstype, DecimalType, UTF8Type
+from cassandra.util import OrderedMap, OrderedMapSerializedKey, sortedset, Time, Date
 
 marshalled_value_pairs = (
     # binary form, type, python native type
@@ -80,21 +75,24 @@ marshalled_value_pairs = (
     (b'', 'MapType(AsciiType, BooleanType)', None),
     (b'', 'ListType(FloatType)', None),
     (b'', 'SetType(LongType)', None),
-    (b'\x00\x00', 'MapType(DecimalType, BooleanType)', OrderedDict()),
-    (b'\x00\x00', 'ListType(FloatType)', ()),
+    (b'\x00\x00', 'MapType(DecimalType, BooleanType)', OrderedMapSerializedKey(DecimalType, 0)),
+    (b'\x00\x00', 'ListType(FloatType)', []),
     (b'\x00\x00', 'SetType(IntegerType)', sortedset()),
-    (b'\x00\x01\x00\x10\xafYC\xa3\xea<\x11\xe1\xabc\xc4,\x03"y\xf0', 'ListType(TimeUUIDType)', (UUID(bytes=b'\xafYC\xa3\xea<\x11\xe1\xabc\xc4,\x03"y\xf0'),)),
+    (b'\x00\x01\x00\x10\xafYC\xa3\xea<\x11\xe1\xabc\xc4,\x03"y\xf0', 'ListType(TimeUUIDType)', [UUID(bytes=b'\xafYC\xa3\xea<\x11\xe1\xabc\xc4,\x03"y\xf0')]),
+    (b'\x80\x00\x00\x01', 'SimpleDateType', Date(1)),
+    (b'\x7f\xff\xff\xff', 'SimpleDateType', Date('1969-12-31')),
+    (b'\x00\x00\x00\x00\x00\x00\x00\x01', 'TimeType', Time(1))
 )
 
-ordered_dict_value = OrderedDict()
-ordered_dict_value[u'\u307fbob'] = 199
-ordered_dict_value[u''] = -1
-ordered_dict_value[u'\\'] = 0
+ordered_map_value = OrderedMapSerializedKey(UTF8Type, 2)
+ordered_map_value._insert(u'\u307fbob', 199)
+ordered_map_value._insert(u'', -1)
+ordered_map_value._insert(u'\\', 0)
 
 # these following entries work for me right now, but they're dependent on
 # vagaries of internal python ordering for unordered types
 marshalled_value_pairs_unsafe = (
-    (b'\x00\x03\x00\x06\xe3\x81\xbfbob\x00\x04\x00\x00\x00\xc7\x00\x00\x00\x04\xff\xff\xff\xff\x00\x01\\\x00\x04\x00\x00\x00\x00', 'MapType(UTF8Type, Int32Type)', ordered_dict_value),
+    (b'\x00\x03\x00\x06\xe3\x81\xbfbob\x00\x04\x00\x00\x00\xc7\x00\x00\x00\x04\xff\xff\xff\xff\x00\x01\\\x00\x04\x00\x00\x00\x00', 'MapType(UTF8Type, Int32Type)', ordered_map_value),
     (b'\x00\x02\x00\x08@\x01\x99\x99\x99\x99\x99\x9a\x00\x08@\x14\x00\x00\x00\x00\x00\x00', 'SetType(DoubleType)', sortedset([2.2, 5.0])),
     (b'\x00', 'IntegerType', 0),
 )
@@ -105,11 +103,11 @@ if platform.python_implementation() == 'CPython':
     marshalled_value_pairs += marshalled_value_pairs_unsafe
 
 
-class TestUnmarshal(unittest.TestCase):
+class UnmarshalTest(unittest.TestCase):
     def test_unmarshalling(self):
         for serializedval, valtype, nativeval in marshalled_value_pairs:
             unmarshaller = lookup_casstype(valtype)
-            whatwegot = unmarshaller.from_binary(serializedval)
+            whatwegot = unmarshaller.from_binary(serializedval, 1)
             self.assertEqual(whatwegot, nativeval,
                              msg='Unmarshaller for %s (%s) failed: unmarshal(%r) got %r instead of %r'
                                  % (valtype, unmarshaller, serializedval, whatwegot, nativeval))
@@ -120,7 +118,7 @@ class TestUnmarshal(unittest.TestCase):
     def test_marshalling(self):
         for serializedval, valtype, nativeval in marshalled_value_pairs:
             marshaller = lookup_casstype(valtype)
-            whatwegot = marshaller.to_binary(nativeval)
+            whatwegot = marshaller.to_binary(nativeval, 1)
             self.assertEqual(whatwegot, serializedval,
                              msg='Marshaller for %s (%s) failed: marshal(%r) got %r instead of %r'
                                  % (valtype, marshaller, nativeval, whatwegot, serializedval))

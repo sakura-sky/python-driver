@@ -1,4 +1,4 @@
-# Copyright 2013-2014 DataStax, Inc.
+# Copyright 2013-2015 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,22 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tests.integration import PROTOCOL_VERSION
-
 try:
     import unittest2 as unittest
 except ImportError:
-    import unittest # noqa
+    import unittest  # noqa
 
 from functools import partial
 from six.moves import range
-import sys
 from threading import Thread, Event
 
 from cassandra import ConsistencyLevel, OperationTimedOut
 from cassandra.cluster import NoHostAvailable
-from cassandra.protocol import QueryMessage
 from cassandra.io.asyncorereactor import AsyncoreConnection
+from cassandra.protocol import QueryMessage
+
+from tests import is_monkey_patched
+from tests.integration import use_singledc, PROTOCOL_VERSION
 
 try:
     from cassandra.io.libevreactor import LibevConnection
@@ -35,9 +35,16 @@ except ImportError:
     LibevConnection = None
 
 
-class ConnectionTest(object):
+def setup_module():
+    use_singledc()
+
+
+class ConnectionTests(object):
 
     klass = None
+
+    def setUp(self):
+        self.klass.initialize_reactor()
 
     def get_connection(self):
         """
@@ -77,10 +84,12 @@ class ConnectionTest(object):
             else:
                 conn.send_msg(
                     QueryMessage(query=query, consistency_level=ConsistencyLevel.ONE),
+                    request_id=0,
                     cb=partial(cb, count))
 
         conn.send_msg(
             QueryMessage(query=query, consistency_level=ConsistencyLevel.ONE),
+            request_id=0,
             cb=partial(cb, 0))
         event.wait()
 
@@ -102,6 +111,7 @@ class ConnectionTest(object):
         for i in range(100):
             conn.send_msg(
                 QueryMessage(query=query, consistency_level=ConsistencyLevel.ONE),
+                request_id=i,
                 cb=partial(cb, responses, i))
 
         event.wait()
@@ -122,11 +132,13 @@ class ConnectionTest(object):
             else:
                 conn.send_msg(
                     QueryMessage(query=query, consistency_level=ConsistencyLevel.ONE),
+                    request_id=count,
                     cb=partial(cb, event, conn, count))
 
         for event, conn in zip(events, conns):
             conn.send_msg(
                 QueryMessage(query=query, consistency_level=ConsistencyLevel.ONE),
+                request_id=0,
                 cb=partial(cb, event, conn, 0))
 
         for event in events:
@@ -153,7 +165,9 @@ class ConnectionTest(object):
         def send_msgs(all_responses, thread_responses):
             for i in range(num_requests_per_conn):
                 qmsg = QueryMessage(query=query, consistency_level=ConsistencyLevel.ONE)
-                conn.send_msg(qmsg, cb=partial(cb, all_responses, thread_responses, i))
+                with conn.lock:
+                    request_id = conn.get_request_id()
+                conn.send_msg(qmsg, request_id, cb=partial(cb, all_responses, thread_responses, i))
 
         all_responses = []
         threads = []
@@ -192,7 +206,9 @@ class ConnectionTest(object):
             thread_responses = [False] * num_requests_per_conn
             for i in range(num_requests_per_conn):
                 qmsg = QueryMessage(query=query, consistency_level=ConsistencyLevel.ONE)
-                conn.send_msg(qmsg, cb=partial(cb, conn, event, thread_responses, i))
+                with conn.lock:
+                    request_id = conn.get_request_id()
+                conn.send_msg(qmsg, request_id, cb=partial(cb, conn, event, thread_responses, i))
 
             event.wait()
 
@@ -209,22 +225,24 @@ class ConnectionTest(object):
             t.join()
 
 
-class AsyncoreConnectionTest(ConnectionTest, unittest.TestCase):
+class AsyncoreConnectionTests(ConnectionTests, unittest.TestCase):
 
     klass = AsyncoreConnection
 
     def setUp(self):
-        if 'gevent.monkey' in sys.modules:
-            raise unittest.SkipTest("Can't test libev with gevent monkey patching")
+        if is_monkey_patched():
+            raise unittest.SkipTest("Can't test asyncore with monkey patching")
+        ConnectionTests.setUp(self)
 
 
-class LibevConnectionTest(ConnectionTest, unittest.TestCase):
+class LibevConnectionTests(ConnectionTests, unittest.TestCase):
 
     klass = LibevConnection
 
     def setUp(self):
-        if 'gevent.monkey' in sys.modules:
-            raise unittest.SkipTest("Can't test libev with gevent monkey patching")
+        if is_monkey_patched():
+            raise unittest.SkipTest("Can't test libev with monkey patching")
         if LibevConnection is None:
             raise unittest.SkipTest(
                 'libev does not appear to be installed properly')
+        ConnectionTests.setUp(self)

@@ -1,4 +1,4 @@
-# Copyright 2013-2014 DataStax, Inc.
+# Copyright 2013-2015 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,34 +18,30 @@ import traceback
 try:
     import unittest2 as unittest
 except ImportError:
-    import unittest # noqa
+    import unittest  # noqa
 
 import logging
 log = logging.getLogger(__name__)
 
 import os
-from six import print_
 from threading import Event
+
+from itertools import groupby
 
 from cassandra.cluster import Cluster
 
 try:
     from ccmlib.cluster import Cluster as CCMCluster
+    from ccmlib.cluster_factory import ClusterFactory as CCMClusterFactory
     from ccmlib import common
 except ImportError as e:
-    raise unittest.SkipTest('ccm is a dependency for integration tests:', e)
+    CCMClusterFactory = None
 
 CLUSTER_NAME = 'test_cluster'
+SINGLE_NODE_CLUSTER_NAME = 'single_node'
 MULTIDC_CLUSTER_NAME = 'multidc_test_cluster'
+
 CCM_CLUSTER = None
-
-CASSANDRA_VERSION = os.getenv('CASSANDRA_VERSION', '2.0.6')
-
-if CASSANDRA_VERSION.startswith('1'):
-    DEFAULT_PROTOCOL_VERSION = 1
-else:
-    DEFAULT_PROTOCOL_VERSION = 2
-PROTOCOL_VERSION = int(os.getenv('PROTOCOL_VERSION', DEFAULT_PROTOCOL_VERSION))
 
 path = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'ccm')
 if not os.path.exists(path):
@@ -65,10 +61,9 @@ def get_server_versions():
     if cass_version is not None:
         return (cass_version, cql_version)
 
-    c = Cluster(protocol_version=PROTOCOL_VERSION)
+    c = Cluster(protocol_version=1)
     s = c.connect()
-    s.set_keyspace('system')
-    row = s.execute('SELECT cql_version, release_version FROM local')[0]
+    row = s.execute('SELECT cql_version, release_version FROM system.local')[0]
 
     cass_version = _tuple_version(row.release_version)
     cql_version = _tuple_version(row.cql_version)
@@ -85,6 +80,41 @@ def _tuple_version(version_string):
     return tuple([int(p) for p in version_string.split('.')])
 
 
+USE_CASS_EXTERNAL = bool(os.getenv('USE_CASS_EXTERNAL', False))
+
+default_cassandra_version = '2.1.2'
+
+if USE_CASS_EXTERNAL and CCMClusterFactory:
+    # see if the external instance is running in ccm
+    path = common.get_default_path()
+    name = common.current_cluster_name(path)
+    CCM_CLUSTER = CCMClusterFactory.load(common.get_default_path(), name)
+    CCM_CLUSTER.start(wait_for_binary_proto=True, wait_other_notice=True)
+
+    cass_ver, _ = get_server_versions()
+    default_cassandra_version = '.'.join('%d' % i for i in cass_ver)
+
+CASSANDRA_DIR = os.getenv('CASSANDRA_DIR', None)
+CASSANDRA_VERSION = os.getenv('CASSANDRA_VERSION', default_cassandra_version)
+
+CCM_KWARGS = {}
+if CASSANDRA_DIR:
+    log.info("Using Cassandra dir: %s", CASSANDRA_DIR)
+    CCM_KWARGS['install_dir'] = CASSANDRA_DIR
+else:
+    log.info('Using Cassandra version: %s', CASSANDRA_VERSION)
+    CCM_KWARGS['version'] = CASSANDRA_VERSION
+
+if CASSANDRA_VERSION > '2.1':
+    default_protocol_version = 3
+elif CASSANDRA_VERSION > '2.0':
+    default_protocol_version = 2
+else:
+    default_protocol_version = 1
+
+PROTOCOL_VERSION = int(os.getenv('PROTOCOL_VERSION', default_protocol_version))
+
+
 def get_cluster():
     return CCM_CLUSTER
 
@@ -93,63 +123,96 @@ def get_node(node_id):
     return CCM_CLUSTER.nodes['node%s' % node_id]
 
 
-def setup_package():
-    print_('Using Cassandra version: %s' % CASSANDRA_VERSION)
-    try:
-        try:
-            cluster = CCMCluster.load(path, CLUSTER_NAME)
-            log.debug("Found existing ccm test cluster, clearing")
-            cluster.clear()
-            cluster.set_cassandra_dir(cassandra_version=CASSANDRA_VERSION)
-        except Exception:
-            log.debug("Creating new ccm test cluster with version %s", CASSANDRA_VERSION)
-            cluster = CCMCluster(path, CLUSTER_NAME, cassandra_version=CASSANDRA_VERSION)
-            cluster.set_configuration_options({'start_native_transport': True})
-            common.switch_cluster(path, CLUSTER_NAME)
-            cluster.populate(3)
-
-        log.debug("Starting ccm test cluster")
-        cluster.start(wait_for_binary_proto=True)
-    except Exception:
-        log.exception("Failed to start ccm cluster:")
-        raise
-
-    global CCM_CLUSTER
-    CCM_CLUSTER = cluster
-    setup_test_keyspace()
-
-
 def use_multidc(dc_list):
-    teardown_package()
+    use_cluster(MULTIDC_CLUSTER_NAME, dc_list, start=True)
+
+
+def use_singledc(start=True):
+    use_cluster(CLUSTER_NAME, [3], start=start)
+
+
+def use_single_node(start=True):
+    use_cluster(SINGLE_NODE_CLUSTER_NAME, [1], start=start)
+
+
+def remove_cluster():
+    if USE_CASS_EXTERNAL:
+        return
+
+    global CCM_CLUSTER
+    if CCM_CLUSTER:
+        log.debug("removing cluster %s", CCM_CLUSTER.name)
+        CCM_CLUSTER.remove()
+        CCM_CLUSTER = None
+
+
+def is_current_cluster(cluster_name, node_counts):
+    global CCM_CLUSTER
+    if CCM_CLUSTER and CCM_CLUSTER.name == cluster_name:
+        if [len(list(nodes)) for dc, nodes in
+                groupby(CCM_CLUSTER.nodelist(), lambda n: n.data_center)] == node_counts:
+            return True
+    return False
+
+
+def use_cluster(cluster_name, nodes, ipformat=None, start=True):
+    global CCM_CLUSTER
+    if USE_CASS_EXTERNAL:
+        if CCM_CLUSTER:
+            log.debug("Using external ccm cluster %s", CCM_CLUSTER.name)
+        else:
+            log.debug("Using unnamed external cluster")
+        return
+
+    if is_current_cluster(cluster_name, nodes):
+        log.debug("Using existing cluster %s", cluster_name)
+        return
+
+    if CCM_CLUSTER:
+        log.debug("Stopping cluster %s", CCM_CLUSTER.name)
+        CCM_CLUSTER.stop()
+
     try:
         try:
-            cluster = CCMCluster.load(path, MULTIDC_CLUSTER_NAME)
-            log.debug("Found existing ccm test multi-dc cluster, clearing")
+            cluster = CCMClusterFactory.load(path, cluster_name)
+            log.debug("Found existing ccm %s cluster; clearing", cluster_name)
             cluster.clear()
+            cluster.set_install_dir(**CCM_KWARGS)
         except Exception:
-            log.debug("Creating new ccm test multi-dc cluster")
-            cluster = CCMCluster(path, MULTIDC_CLUSTER_NAME, cassandra_version=CASSANDRA_VERSION)
+            log.debug("Creating new ccm %s cluster with %s", cluster_name, CCM_KWARGS)
+            cluster = CCMCluster(path, cluster_name, **CCM_KWARGS)
             cluster.set_configuration_options({'start_native_transport': True})
-            common.switch_cluster(path, MULTIDC_CLUSTER_NAME)
-            cluster.populate(dc_list)
+            common.switch_cluster(path, cluster_name)
+            cluster.populate(nodes, ipformat=ipformat)
 
-        log.debug("Starting ccm test cluster")
-        cluster.start(wait_for_binary_proto=True)
+        if start:
+            log.debug("Starting ccm %s cluster", cluster_name)
+            cluster.start(wait_for_binary_proto=True, wait_other_notice=True)
+            setup_test_keyspace()
+
+        CCM_CLUSTER = cluster
     except Exception:
         log.exception("Failed to start ccm cluster:")
         raise
 
-    global CCM_CLUSTER
-    CCM_CLUSTER = cluster
-    setup_test_keyspace()
-    log.debug("Switched to multidc cluster")
 
+def teardown_package():
+    if USE_CASS_EXTERNAL:
+        return
+    # when multiple modules are run explicitly, this runs between them
+    # need to make sure CCM_CLUSTER is properly cleared for that case
+    remove_cluster()
+    for cluster_name in [CLUSTER_NAME, MULTIDC_CLUSTER_NAME]:
+        try:
+            cluster = CCMClusterFactory.load(path, cluster_name)
+            try:
+                cluster.remove()
+                log.info('Removed cluster: %s' % cluster_name)
+            except Exception:
+                log.exception('Failed to remove cluster: %s' % cluster_name)
 
-def use_singledc():
-    teardown_package()
-
-    setup_package()
-    log.debug("Switched to singledc cluster")
+        except Exception:
+            log.warn('Did not find cluster: %s' % cluster_name)
 
 
 def setup_test_keyspace():
@@ -186,27 +249,12 @@ def setup_test_keyspace():
                 k int PRIMARY KEY,
                 v int )'''
         session.execute(ddl)
+
     except Exception:
         traceback.print_exc()
         raise
     finally:
         cluster.shutdown()
-
-
-def teardown_package():
-    for cluster_name in [CLUSTER_NAME, MULTIDC_CLUSTER_NAME]:
-        try:
-            cluster = CCMCluster.load(path, cluster_name)
-
-            try:
-                cluster.clear()
-                cluster.remove()
-                log.info('Cleared cluster: %s' % cluster_name)
-            except Exception:
-                log.exception('Failed to clear cluster: %s' % cluster_name)
-
-        except Exception:
-            log.warn('Did not find cluster: %s' % cluster_name)
 
 
 class UpDownWaiter(object):

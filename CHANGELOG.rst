@@ -1,13 +1,208 @@
+2.5.0
+=====
+March 30, 2015
+
+Features
+--------
+* Integrated cqlengine object mapping package
+* Utility functions for converting timeuuids and datetime (PYTHON-99)
+* Schema metadata fetch window randomized, config options added (PYTHON-202)
+* Support for new Date and Time Cassandra types (PYTHON-190)
+
+Bug Fixes
+---------
+* Fix index target for collection indexes (full(), keys()) (PYTHON-222)
+* Thread exception during GIL cleanup (PYTHON-229)
+* Workaround for rounding anomaly in datetime.utcfromtime (Python 3.4) (PYTHON-230)
+* Normalize text serialization for lookup in OrderedMap (PYTHON-231)
+* Support reading CompositeType data (PYTHON-234)
+
+2.1.4
+=====
+January 26, 2015
+
+Features
+--------
+* SaslAuthenticator for Kerberos support (PYTHON-109)
+* Heartbeat for network device keepalive and detecting failures on idle connections (PYTHON-197)
+* Support nested, frozen collections for Cassandra 2.1.3+ (PYTHON-186)
+* Schema agreement wait bypass config, new call for synchronous schema refresh (PYTHON-205)
+* Add eventlet connection support (PYTHON-194)
+
+Bug Fixes
+---------
+* Schema meta fix for complex thrift tables (PYTHON-191)
+* Support for 'unknown' replica placement strategies in schema meta (PYTHON-192)
+* Resolve stream ID leak on set_keyspace (PYTHON-195)
+* Remove implicit timestamp scaling on serialization of numeric timestamps (PYTHON-204)
+* Resolve stream id collision when using SASL auth (PYTHON-210)
+* Correct unhexlify usage for user defined type meta in Python3 (PYTHON-208)
+
+2.1.3
+=====
+December 16, 2014
+
+Features
+--------
+* INFO-level log confirmation that a connection was opened to a node that was marked up (PYTHON-116)
+* Avoid connecting to peer with incomplete metadata (PYTHON-163)
+* Add SSL support to gevent reactor (PYTHON-174)
+* Use control connection timeout in wait for schema agreement (PYTHON-175)
+* Better consistency level representation in unavailable+timeout exceptions (PYTHON-180)
+* Update schema metadata processing to accommodate coming schema modernization (PYTHON-185)
+
+Bug Fixes
+---------
+* Support large negative timestamps on Windows (PYTHON-119)
+* Fix schema agreement for clusters with peer rpc_addres 0.0.0.0 (PYTHON-166)
+* Retain table metadata following keyspace meta refresh (PYTHON-173)
+* Use a timeout when preparing a statement for all nodes (PYTHON-179)
+* Make TokenAware routing tolerant of statements with no keyspace (PYTHON-181)
+* Update add_collback to store/invoke multiple callbacks (PYTHON-182)
+* Correct routing key encoding for composite keys (PYTHON-184)
+* Include compression option in schema export string when disabled (PYTHON-187)
+
+2.1.2
+=====
+October 16, 2014
+
+Features
+--------
+* Allow DCAwareRoundRobinPolicy to be constructed without a local_dc, defaulting
+  instead to the DC of a contact_point (PYTHON-126)
+* Set routing key in BatchStatement.add() if none specified in batch (PYTHON-148)
+* Improved feedback on ValueError using named_tuple_factory with invalid column names (PYTHON-122)
+
+Bug Fixes
+---------
+* Make execute_concurrent compatible with Python 2.6 (PYTHON-159)
+* Handle Unauthorized message on schema_triggers query (PYTHON-155)
+* Make execute_concurrent compatible with Python 2.6 (github-197)
+* Pure Python sorted set in support of UDTs nested in collections (PYTON-167)
+* Support CUSTOM index metadata and string export (PYTHON-165)
+
+2.1.1
+=====
+September 11, 2014
+
+Features
+--------
+* Detect triggers and include them in CQL queries generated to recreate
+  the schema (github-189)
+* Support IPv6 addresses (PYTHON-144) (note: basic functionality added; Windows
+  platform not addressed (PYTHON-20))
+
+Bug Fixes
+---------
+* Fix NetworkTopologyStrategy.export_for_schema (PYTHON-120)
+* Keep timeout for paged results (PYTHON-150)
+
+Other
+-----
+* Add frozen<> type modifier to UDTs and tuples to handle CASSANDRA-7857
+
+2.1.0
+=====
+August 7, 2014
+
+Bug Fixes
+---------
+* Correctly serialize and deserialize null values in tuples and
+  user-defined types (PYTHON-110)
+* Include additional header and lib dirs, allowing libevwrapper to build
+  against Homebrew and Mac Ports installs of libev (PYTHON-112 and 804dea3)
+
+2.1.0c1
+=======
+July 25, 2014
+
+Bug Fixes
+---------
+* Properly specify UDTs for columns in CREATE TABLE statements
+* Avoid moving retries to a new host when using request ID zero (PYTHON-88)
+* Don't ignore fetch_size arguments to Statement constructors (github-151)
+* Allow disabling automatic paging on a per-statement basis when it's
+  enabled by default for the session (PYTHON-93)
+* Raise ValueError when tuple query parameters for prepared statements
+  have extra items (PYTHON-98)
+* Correctly encode nested tuples and UDTs for non-prepared statements (PYTHON-100)
+* Raise TypeError when a string is used for contact_points (github #164)
+* Include User Defined Types in KeyspaceMetadata.export_as_string() (PYTHON-96)
+
+Other
+-----
+* Return list collection columns as python lists instead of tuples
+  now that tuples are a specific Cassandra type
+
+2.1.0b1
+=======
+July 11, 2014
+
+This release adds support for Cassandra 2.1 features, including version
+3 of the native protocol.
+
+Features
+--------
+* When using the v3 protocol, only one connection is opened per-host, and
+  throughput is improved due to reduced pooling overhead and lock contention.
+* Support for user-defined types (Cassandra 2.1+)
+* Support for tuple type in (limited usage Cassandra 2.0.9, full usage
+  in Cassandra 2.1)
+* Protocol-level client-side timestamps (see Session.use_client_timestamp)
+* Overridable type encoding for non-prepared statements (see Session.encoders)
+* Configurable serial consistency levels for batch statements
+* Use io.BytesIO for reduced CPU consumption (github #143)
+* Support Twisted as a reactor. Note that a Twisted-compatible
+  API is not exposed (so no Deferreds), this is just a reactor
+  implementation. (github #135, PYTHON-8)
+
+Bug Fixes
+---------
+* Fix references to xrange that do not go through "six" in libevreactor and
+  geventreactor (github #138)
+* Make BoundStatements inherit fetch_size from their parent
+  PreparedStatement (PYTHON-80)
+* Clear reactor state in child process after forking to prevent errors with
+  multiprocessing when the parent process has connected a Cluster before
+  forking (github #141)
+* Don't share prepared statement lock across Cluster instances
+* Format CompositeType and DynamicCompositeType columns correctly in
+  CREATE TABLE statements.
+* Fix cassandra.concurrent behavior when dealing with automatic paging
+  (PYTHON-81)
+* Properly defunct connections after protocol errors
+* Avoid UnicodeDecodeError when query string is unicode (PYTHON-76)
+* Correctly capture dclocal_read_repair_chance for tables and
+  use it when generating CREATE TABLE statements (PYTHON-84)
+* Avoid race condition with AsyncoreConnection that may cause messages
+  to fail to be written until a new message is pushed
+* Make sure cluster.metadata.partitioner and cluster.metadata.token_map
+  are populated when all nodes in the cluster are included in the
+  contact points (PYTHON-90)
+* Make Murmur3 hash match Cassandra's hash for all values (PYTHON-89,
+  github #147)
+* Don't attempt to reconnect to hosts that should be ignored (according
+  to the load balancing policy) when a notification is received that the
+  host is down.
+* Add CAS WriteType, avoiding KeyError on CAS write timeout (PYTHON-91)
+
 2.0.2
 =====
+June 10, 2014
 
 Bug Fixes
 ---------
 * Add six to requirements.txt
 * Avoid KeyError during schema refresh when a keyspace is dropped
   and TokenAwarePolicy is not in use
-* Avoid registering multiple atexit() cleanup functions will the
+* Avoid registering multiple atexit cleanup functions when the
   asyncore event loop is restarted multiple times
+* Delay initialization of reactors in order to avoid problems
+  with shared state when using multiprocessing (PYTHON-60)
+* Add python-six to debian dependencies, move python-blist to recommends
+* Fix memory leak when libev connections are created and
+  destroyed (github #93)
+* Ensure token map is rebuilt when hosts are removed from the cluster
 
 2.0.1
 =====
@@ -104,6 +299,9 @@ now:
 * cassandra.decoder.named_tuple_factory has moved to cassandra.query.named_tuple_factory
 * cassandra.decoder.dict_factory has moved to cassandra.query.dict_factory
 * cassandra.decoder.ordered_dict_factory has moved to cassandra.query.ordered_dict_factory
+
+Exceptions that were in cassandra.decoder have been moved to cassandra.protocol. If
+you handle any of these exceptions, you must adjust the code accordingly.
 
 1.1.2
 =====

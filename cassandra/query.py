@@ -1,4 +1,4 @@
-# Copyright 2013-2014 DataStax, Inc.
+# Copyright 2013-2015 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,8 +27,8 @@ import six
 
 from cassandra import ConsistencyLevel, OperationTimedOut
 from cassandra.cqltypes import unix_time_from_uuid1
-from cassandra.encoder import (cql_encoders, cql_encode_object,
-                               cql_encode_sequence)
+from cassandra.encoder import Encoder
+import cassandra.encoder
 from cassandra.util import OrderedDict
 
 import logging
@@ -57,7 +57,7 @@ def tuple_factory(colnames, rows):
 
     Example::
 
-        >>> from cassandra.query import named_tuple_factory
+        >>> from cassandra.query import tuple_factory
         >>> session = cluster.connect('mykeyspace')
         >>> session.row_factory = tuple_factory
         >>> rows = session.execute("SELECT name, age FROM users LIMIT 1")
@@ -99,7 +99,18 @@ def named_tuple_factory(colnames, rows):
     .. versionchanged:: 2.0.0
         moved from ``cassandra.decoder`` to ``cassandra.query``
     """
-    Row = namedtuple('Row', map(_clean_column_name, colnames))
+    clean_column_names = map(_clean_column_name, colnames)
+    try:
+        Row = namedtuple('Row', clean_column_names)
+    except Exception:
+        log.warning("Failed creating named tuple for results with column names %s (cleaned: %s) "
+                    "(see Python 'namedtuple' documentation for details on name rules). "
+                    "Results will be returned with positional names. "
+                    "Avoid this by choosing different names, using SELECT \"<col name>\" AS aliases, "
+                    "or specifying a different row_factory on your Session" %
+                    (colnames, clean_column_names))
+        Row = namedtuple('Row', clean_column_names, rename=True)
+
     return [Row(*row) for row in rows]
 
 
@@ -109,12 +120,12 @@ def dict_factory(colnames, rows):
 
     Example::
 
-        >>> from cassandra.query import named_tuple_factory
+        >>> from cassandra.query import dict_factory
         >>> session = cluster.connect('mykeyspace')
         >>> session.row_factory = dict_factory
         >>> rows = session.execute("SELECT name, age FROM users LIMIT 1")
         >>> print rows[0]
-        {'age': 42, 'name': 'Bob'}
+        {u'age': 42, u'name': u'Bob'}
 
     .. versionchanged:: 2.0.0
         moved from ``cassandra.decoder`` to ``cassandra.query``
@@ -131,6 +142,9 @@ def ordered_dict_factory(colnames, rows):
         moved from ``cassandra.decoder`` to ``cassandra.query``
     """
     return [OrderedDict(zip(colnames, row)) for row in rows]
+
+
+FETCH_SIZE_UNSET = object()
 
 
 class Statement(object):
@@ -160,7 +174,7 @@ class Statement(object):
     the Session this is executed in will be used.
     """
 
-    fetch_size = None
+    fetch_size = FETCH_SIZE_UNSET
     """
     How many rows will be fetched at a time.  This overrides the default
     of :attr:`.Session.default_fetch_size`
@@ -171,19 +185,33 @@ class Statement(object):
     .. versionadded:: 2.0.0
     """
 
+    keyspace = None
+    """
+    The string name of the keyspace this query acts on. This is used when
+    :class:`~.TokenAwarePolicy` is configured for
+    :attr:`.Cluster.load_balancing_policy`
+
+    It is set implicitly on :class:`.BoundStatement`, and :class:`.BatchStatement`,
+    but must be set explicitly on :class:`.SimpleStatement`.
+
+    .. versionadded:: 2.1.3
+    """
+
     _serial_consistency_level = None
     _routing_key = None
 
     def __init__(self, retry_policy=None, consistency_level=None, routing_key=None,
-                 serial_consistency_level=None, fetch_size=None):
+                 serial_consistency_level=None, fetch_size=FETCH_SIZE_UNSET, keyspace=None):
         self.retry_policy = retry_policy
         if consistency_level is not None:
             self.consistency_level = consistency_level
+        self._routing_key = routing_key
         if serial_consistency_level is not None:
             self.serial_consistency_level = serial_consistency_level
-        if fetch_size is not None:
-            self.fetch_size = None
-        self._routing_key = routing_key
+        if fetch_size is not FETCH_SIZE_UNSET:
+            self.fetch_size = fetch_size
+        if keyspace is not None:
+            self.keyspace = keyspace
 
     def _get_routing_key(self):
         return self._routing_key
@@ -225,9 +253,9 @@ class Statement(object):
         self._serial_consistency_level = None
 
     serial_consistency_level = property(
-         _get_serial_consistency_level,
-         _set_serial_consistency_level,
-         _del_serial_consistency_level,
+        _get_serial_consistency_level,
+        _set_serial_consistency_level,
+        _del_serial_consistency_level,
         """
         The serial consistency level is only used by conditional updates
         (``INSERT``, ``UPDATE`` and ``DELETE`` with an ``IF`` condition).  For
@@ -258,13 +286,6 @@ class Statement(object):
 
         .. versionadded:: 2.0.0
         """)
-
-    @property
-    def keyspace(self):
-        """
-        The string name of the keyspace this query acts on.
-        """
-        return None
 
 
 class SimpleStatement(Statement):
@@ -306,28 +327,35 @@ class PreparedStatement(object):
     column_metadata = None
     query_id = None
     query_string = None
-    keyspace = None
+    keyspace = None  # change to prepared_keyspace in major release
 
     routing_key_indexes = None
 
     consistency_level = None
     serial_consistency_level = None
 
+    protocol_version = None
+
+    fetch_size = FETCH_SIZE_UNSET
+
     def __init__(self, column_metadata, query_id, routing_key_indexes, query, keyspace,
-                 consistency_level=None, serial_consistency_level=None, fetch_size=None):
+                 protocol_version, consistency_level=None, serial_consistency_level=None,
+                 fetch_size=FETCH_SIZE_UNSET):
         self.column_metadata = column_metadata
         self.query_id = query_id
         self.routing_key_indexes = routing_key_indexes
         self.query_string = query
         self.keyspace = keyspace
+        self.protocol_version = protocol_version
         self.consistency_level = consistency_level
         self.serial_consistency_level = serial_consistency_level
-        self.fetch_size = fetch_size
+        if fetch_size is not FETCH_SIZE_UNSET:
+            self.fetch_size = fetch_size
 
     @classmethod
-    def from_message(cls, query_id, column_metadata, cluster_metadata, query, keyspace):
+    def from_message(cls, query_id, column_metadata, cluster_metadata, query, prepared_keyspace, protocol_version):
         if not column_metadata:
-            return PreparedStatement(column_metadata, query_id, None, query, keyspace)
+            return PreparedStatement(column_metadata, query_id, None, query, prepared_keyspace, protocol_version)
 
         partition_key_columns = None
         routing_key_indexes = None
@@ -346,11 +374,11 @@ class PreparedStatement(object):
                 try:
                     routing_key_indexes = [statement_indexes[c.name]
                                            for c in partition_key_columns]
-                except KeyError:
-                    pass  # we're missing a partition key component in the prepared
-                          # statement; just leave routing_key_indexes as None
+                except KeyError:  # we're missing a partition key component in the prepared
+                    pass          # statement; just leave routing_key_indexes as None
 
-        return PreparedStatement(column_metadata, query_id, routing_key_indexes, query, keyspace)
+        return PreparedStatement(column_metadata, query_id, routing_key_indexes,
+                                 query, prepared_keyspace, protocol_version)
 
     def bind(self, values):
         """
@@ -390,10 +418,16 @@ class BoundStatement(Statement):
         `prepared_statement` should be an instance of :class:`PreparedStatement`.
         All other ``*args`` and ``**kwargs`` will be passed to :class:`.Statement`.
         """
+        self.prepared_statement = prepared_statement
+
         self.consistency_level = prepared_statement.consistency_level
         self.serial_consistency_level = prepared_statement.serial_consistency_level
-        self.prepared_statement = prepared_statement
+        self.fetch_size = prepared_statement.fetch_size
         self.values = []
+
+        meta = prepared_statement.column_metadata
+        if meta:
+            self.keyspace = meta[0][0]
 
         Statement.__init__(self, *args, **kwargs)
 
@@ -407,6 +441,8 @@ class BoundStatement(Statement):
         if values is None:
             values = ()
         col_meta = self.prepared_statement.column_metadata
+
+        proto_version = self.prepared_statement.protocol_version
 
         # special case for binding dicts
         if isinstance(values, dict):
@@ -448,6 +484,12 @@ class BoundStatement(Statement):
                 "Too many arguments provided to bind() (got %d, expected %d)" %
                 (len(values), len(col_meta)))
 
+        if self.prepared_statement.routing_key_indexes and \
+           len(values) < len(self.prepared_statement.routing_key_indexes):
+            raise ValueError(
+                "Too few arguments provided to bind() (got %d, required %d for routing key)" %
+                (len(values), len(self.prepared_statement.routing_key_indexes)))
+
         self.raw_values = values
         self.values = []
         for value, col_spec in zip(values, col_meta):
@@ -457,14 +499,14 @@ class BoundStatement(Statement):
                 col_type = col_spec[-1]
 
                 try:
-                    self.values.append(col_type.serialize(value))
-                except (TypeError, struct.error):
+                    self.values.append(col_type.serialize(value, proto_version))
+                except (TypeError, struct.error) as exc:
                     col_name = col_spec[2]
                     expected_type = col_type
                     actual_type = type(value)
 
                     message = ('Received an argument of invalid type for column "%s". '
-                               'Expected: %s, Got: %s' % (col_name, expected_type, actual_type))
+                               'Expected: %s, Got: %s; (%s)' % (col_name, expected_type, actual_type, exc))
                     raise TypeError(message)
 
         return self
@@ -484,19 +526,12 @@ class BoundStatement(Statement):
             components = []
             for statement_index in routing_indexes:
                 val = self.values[statement_index]
-                components.append(struct.pack("HsB", len(val), val, 0))
+                l = len(val)
+                components.append(struct.pack(">H%dsB" % l, l, val, 0))
 
             self._routing_key = b"".join(components)
 
         return self._routing_key
-
-    @property
-    def keyspace(self):
-        meta = self.prepared_statement.column_metadata
-        if meta:
-            return meta[0][0]
-        else:
-            return None
 
     def __str__(self):
         consistency = ConsistencyLevel.value_to_name.get(self.consistency_level, 'Not Set')
@@ -558,10 +593,17 @@ class BatchStatement(Statement):
     :attr:`.BatchType.LOGGED`.
     """
 
+    serial_consistency_level = None
+    """
+    The same as :attr:`.Statement.serial_consistency_level`, but is only
+    supported when using protocol version 3 or higher.
+    """
+
     _statements_and_parameters = None
+    _session = None
 
     def __init__(self, batch_type=BatchType.LOGGED, retry_policy=None,
-                 consistency_level=None):
+                 consistency_level=None, serial_consistency_level=None, session=None):
         """
         `batch_type` specifies The :class:`.BatchType` for the batch operation.
         Defaults to :attr:`.BatchType.LOGGED`.
@@ -589,15 +631,20 @@ class BatchStatement(Statement):
         .. code-block:: python
 
             batch = BatchStatement()
-            batch.add(SimpleStatement("INSERT INTO users (name, age) VALUES (%s, %s)", (name, age))
-            batch.add(SimpleStatement("DELETE FROM pending_users WHERE name=%s", (name,))
+            batch.add(SimpleStatement("INSERT INTO users (name, age) VALUES (%s, %s)"), (name, age))
+            batch.add(SimpleStatement("DELETE FROM pending_users WHERE name=%s"), (name,))
             session.execute(batch)
 
         .. versionadded:: 2.0.0
+
+        .. versionchanged:: 2.1.0
+            Added `serial_consistency_level` as a parameter
         """
         self.batch_type = batch_type
         self._statements_and_parameters = []
-        Statement.__init__(self, retry_policy=retry_policy, consistency_level=consistency_level)
+        self._session = session
+        Statement.__init__(self, retry_policy=retry_policy, consistency_level=consistency_level,
+                           serial_consistency_level=serial_consistency_level)
 
     def add(self, statement, parameters=None):
         """
@@ -609,11 +656,13 @@ class BatchStatement(Statement):
         """
         if isinstance(statement, six.string_types):
             if parameters:
-                statement = bind_params(statement, parameters)
+                encoder = Encoder() if self._session is None else self._session.encoder
+                statement = bind_params(statement, parameters, encoder)
             self._statements_and_parameters.append((False, statement, ()))
         elif isinstance(statement, PreparedStatement):
             query_id = statement.query_id
             bound_statement = statement.bind(() if parameters is None else parameters)
+            self._maybe_set_routing_attributes(bound_statement)
             self._statements_and_parameters.append(
                 (True, query_id, bound_statement.values))
         elif isinstance(statement, BoundStatement):
@@ -621,13 +670,16 @@ class BatchStatement(Statement):
                 raise ValueError(
                     "Parameters cannot be passed with a BoundStatement "
                     "to BatchStatement.add()")
+            self._maybe_set_routing_attributes(statement)
             self._statements_and_parameters.append(
                 (True, statement.prepared_statement.query_id, statement.values))
         else:
             # it must be a SimpleStatement
             query_string = statement.query_string
             if parameters:
-                query_string = bind_params(query_string, parameters)
+                encoder = Encoder() if self._session is None else self._session.encoder
+                query_string = bind_params(query_string, parameters, encoder)
+            self._maybe_set_routing_attributes(statement)
             self._statements_and_parameters.append((False, query_string, ()))
         return self
 
@@ -640,6 +692,12 @@ class BatchStatement(Statement):
         for statement, value in zip(statements, parameters):
             self.add(statement, parameters)
 
+    def _maybe_set_routing_attributes(self, statement):
+        if self.routing_key is None:
+            if statement.keyspace and statement.routing_key:
+                self.routing_key = statement.routing_key
+                self.keyspace = statement.keyspace
+
     def __str__(self):
         consistency = ConsistencyLevel.value_to_name.get(self.consistency_level, 'Not Set')
         return (u'<BatchStatement type=%s, statements=%d, consistency=%s>' %
@@ -647,33 +705,27 @@ class BatchStatement(Statement):
     __repr__ = __str__
 
 
-class ValueSequence(object):
-    """
-    A wrapper class that is used to specify that a sequence of values should
-    be treated as a CQL list of values instead of a single column collection when used
-    as part of the `parameters` argument for :meth:`.Session.execute()`.
+ValueSequence = cassandra.encoder.ValueSequence
+"""
+A wrapper class that is used to specify that a sequence of values should
+be treated as a CQL list of values instead of a single column collection when used
+as part of the `parameters` argument for :meth:`.Session.execute()`.
 
-    This is typically needed when supplying a list of keys to select.
-    For example::
+This is typically needed when supplying a list of keys to select.
+For example::
 
-        >>> my_user_ids = ('alice', 'bob', 'charles')
-        >>> query = "SELECT * FROM users WHERE user_id IN %s"
-        >>> session.execute(query, parameters=[ValueSequence(my_user_ids)])
+    >>> my_user_ids = ('alice', 'bob', 'charles')
+    >>> query = "SELECT * FROM users WHERE user_id IN %s"
+    >>> session.execute(query, parameters=[ValueSequence(my_user_ids)])
 
-    """
-
-    def __init__(self, sequence):
-        self.sequence = sequence
-
-    def __str__(self):
-        return cql_encode_sequence(self.sequence)
+"""
 
 
-def bind_params(query, params):
+def bind_params(query, params, encoder):
     if isinstance(params, dict):
-        return query % dict((k, cql_encoders.get(type(v), cql_encode_object)(v)) for k, v in six.iteritems(params))
+        return query % dict((k, encoder.cql_encode_all_types(v)) for k, v in six.iteritems(params))
     else:
-        return query % tuple(cql_encoders.get(type(v), cql_encode_object)(v) for v in params)
+        return query % tuple(encoder.cql_encode_all_types(v) for v in params)
 
 
 class TraceUnavailable(Exception):

@@ -12,12 +12,14 @@ Linux, OSX, and Windows are supported.
 Installation through pip
 ------------------------
 `pip <https://pypi.python.org/pypi/pip>`_ is the suggested tool for installing
-packages.  It will handle installing all python dependencies for the driver at
-the same time as the driver itself.  To install the driver::
+packages.  It will handle installing all Python dependencies for the driver at
+the same time as the driver itself.  To install the driver*::
 
     pip install cassandra-driver
 
 You can use ``pip install --pre cassandra-driver`` if you need to install a beta version.
+
+***Note**: if intending to use optional extensions, install the `dependencies <#optional-non-python-dependencies>`_ first. The driver may need to be reinstalled if dependencies are added after the initial installation.
 
 OSX Installation Error
 ^^^^^^^^^^^^^^^^^^^^^^
@@ -100,7 +102,7 @@ When installing manually through setup.py, you can disable both with
 the ``--no-extensions`` option, or selectively disable one or the other
 with ``--no-murmur3`` and ``--no-libev``.
 
-To compile the extenions, ensure that GCC and the Python headers are available.
+To compile the extensions, ensure that GCC and the Python headers are available.
 
 On Ubuntu and Debian, this can be accomplished by running::
 

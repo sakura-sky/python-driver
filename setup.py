@@ -1,4 +1,4 @@
-# Copyright 2013-2014 DataStax, Inc.
+# Copyright 2013-2015 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,13 +14,20 @@
 
 from __future__ import print_function
 import sys
+import warnings
+
+if __name__ == '__main__' and sys.argv[1] == "gevent_nosetests":
+    print("Running gevent tests")
+    from gevent.monkey import patch_all
+    patch_all()
+
+if __name__ == '__main__' and sys.argv[1] == "eventlet_nosetests":
+    print("Running eventlet tests")
+    from eventlet import monkey_patch
+    monkey_patch()
 
 import ez_setup
 ez_setup.use_setuptools()
-
-if __name__ == '__main__' and sys.argv[1] == "gevent_nosetests":
-    from gevent.monkey import patch_all
-    patch_all()
 
 from setuptools import setup
 from distutils.command.build_ext import build_ext
@@ -50,9 +57,21 @@ try:
     from nose.commands import nosetests
 except ImportError:
     gevent_nosetests = None
+    eventlet_nosetests = None
 else:
     class gevent_nosetests(nosetests):
         description = "run nosetests with gevent monkey patching"
+
+    class eventlet_nosetests(nosetests):
+        description = "run nosetests with eventlet monkey patching"
+
+has_cqlengine = False
+if __name__ == '__main__' and sys.argv[1] == "install":
+    try:
+        import cqlengine
+        has_cqlengine = True
+    except ImportError:
+        pass
 
 
 class DocCommand(Command):
@@ -95,7 +114,7 @@ class DocCommand(Command):
 
             print("")
             print("Documentation step '%s' performed, results here:" % mode)
-            print("   %s/" % path)
+            print("   file://%s/%s/index.html" % (os.path.dirname(os.path.realpath(__file__)), path))
 
 
 class BuildFailed(Exception):
@@ -109,8 +128,9 @@ murmur3_ext = Extension('cassandra.murmur3',
 
 libev_ext = Extension('cassandra.io.libevwrapper',
                       sources=['cassandra/io/libevwrapper.c'],
-                      include_dirs=['/usr/include/libev'],
-                      libraries=['ev'])
+                      include_dirs=['/usr/include/libev', '/usr/local/include', '/opt/local/include'],
+                      libraries=['ev'],
+                      library_dirs=['/usr/local/lib', '/opt/local/lib'])
 
 
 class build_extensions(build_ext):
@@ -172,9 +192,13 @@ On OSX, via homebrew:
 
 
 def run_setup(extensions):
+
     kw = {'cmdclass': {'doc': DocCommand}}
     if gevent_nosetests is not None:
         kw['cmdclass']['gevent_nosetests'] = gevent_nosetests
+
+    if eventlet_nosetests is not None:
+        kw['cmdclass']['eventlet_nosetests'] = eventlet_nosetests
 
     if extensions:
         kw['cmdclass']['build_ext'] = build_extensions
@@ -190,10 +214,11 @@ def run_setup(extensions):
         url='http://github.com/datastax/python-driver',
         author='Tyler Hobbs',
         author_email='tyler@datastax.com',
-        packages=['cassandra', 'cassandra.io'],
+        packages=['cassandra', 'cassandra.io', 'cassandra.cqlengine'],
+        keywords='cassandra,cql,orm',
         include_package_data=True,
         install_requires=dependencies,
-        tests_require=['nose', 'mock', 'PyYAML', 'pytz'],
+        tests_require=['nose', 'mock', 'PyYAML', 'pytz', 'sure'],
         classifiers=[
             'Development Status :: 5 - Production/Stable',
             'Intended Audience :: Developers',
@@ -255,3 +280,8 @@ while True:
         extensions.remove(failure.ext)
     else:
         break
+
+if has_cqlengine:
+    warnings.warn("\n#######\n'cqlengine' package is present on path: %s\n"
+                  "cqlengine is now an integrated sub-package of this driver.\n"
+                  "It is recommended to remove this package to reduce the chance for conflicting usage" % cqlengine.__file__)

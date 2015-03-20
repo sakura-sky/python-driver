@@ -1,4 +1,4 @@
-# Copyright 2013-2014 DataStax, Inc.
+# Copyright 2013-2015 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import tempfile
-
 try:
     import unittest2 as unittest
 except ImportError:
@@ -20,16 +18,21 @@ except ImportError:
 
 from binascii import unhexlify
 import datetime
+import tempfile
+import six
+import time
+
 import cassandra
 from cassandra.cqltypes import (BooleanType, lookup_casstype_simple, lookup_casstype,
                                 LongType, DecimalType, SetType, cql_typename,
                                 CassandraType, UTF8Type, parse_casstype_args,
-                                EmptyValue, _CassandraType, DateType)
-from cassandra.query import named_tuple_factory
+                                SimpleDateType, TimeType,
+                                EmptyValue, _CassandraType, DateType, int64_pack)
+from cassandra.encoder import cql_quote
 from cassandra.protocol import (write_string, read_longstring, write_stringmap,
                                 read_stringmap, read_inet, write_inet,
                                 read_string, write_longstring)
-from cassandra.encoder import cql_quote
+from cassandra.query import named_tuple_factory
 
 
 class TypeTests(unittest.TestCase):
@@ -51,7 +54,9 @@ class TypeTests(unittest.TestCase):
         self.assertEqual(lookup_casstype_simple('Int32Type'), cassandra.cqltypes.Int32Type)
         self.assertEqual(lookup_casstype_simple('UTF8Type'), cassandra.cqltypes.UTF8Type)
         self.assertEqual(lookup_casstype_simple('DateType'), cassandra.cqltypes.DateType)
+        self.assertEqual(lookup_casstype_simple('SimpleDateType'), cassandra.cqltypes.SimpleDateType)
         self.assertEqual(lookup_casstype_simple('TimeUUIDType'), cassandra.cqltypes.TimeUUIDType)
+        self.assertEqual(lookup_casstype_simple('TimeType'), cassandra.cqltypes.TimeType)
         self.assertEqual(lookup_casstype_simple('UUIDType'), cassandra.cqltypes.UUIDType)
         self.assertEqual(lookup_casstype_simple('IntegerType'), cassandra.cqltypes.IntegerType)
         self.assertEqual(lookup_casstype_simple('MapType'), cassandra.cqltypes.MapType)
@@ -73,6 +78,7 @@ class TypeTests(unittest.TestCase):
         self.assertEqual(lookup_casstype('BytesType'), cassandra.cqltypes.BytesType)
         self.assertEqual(lookup_casstype('BooleanType'), cassandra.cqltypes.BooleanType)
         self.assertEqual(lookup_casstype('CounterColumnType'), cassandra.cqltypes.CounterColumnType)
+        self.assertEqual(lookup_casstype('DateType'), cassandra.cqltypes.DateType)
         self.assertEqual(lookup_casstype('DecimalType'), cassandra.cqltypes.DecimalType)
         self.assertEqual(lookup_casstype('DoubleType'), cassandra.cqltypes.DoubleType)
         self.assertEqual(lookup_casstype('FloatType'), cassandra.cqltypes.FloatType)
@@ -80,6 +86,7 @@ class TypeTests(unittest.TestCase):
         self.assertEqual(lookup_casstype('Int32Type'), cassandra.cqltypes.Int32Type)
         self.assertEqual(lookup_casstype('UTF8Type'), cassandra.cqltypes.UTF8Type)
         self.assertEqual(lookup_casstype('DateType'), cassandra.cqltypes.DateType)
+        self.assertEqual(lookup_casstype('TimeType'), cassandra.cqltypes.TimeType)
         self.assertEqual(lookup_casstype('TimeUUIDType'), cassandra.cqltypes.TimeUUIDType)
         self.assertEqual(lookup_casstype('UUIDType'), cassandra.cqltypes.UUIDType)
         self.assertEqual(lookup_casstype('IntegerType'), cassandra.cqltypes.IntegerType)
@@ -99,11 +106,7 @@ class TypeTests(unittest.TestCase):
         # like "MapType(AsciiType, IntegerType)" and "ReversedType(AsciiType)"
         self.assertEqual(str(lookup_casstype(BooleanType(True))), str(BooleanType(True)))
 
-    def test_cassandratype(self):
-        """
-        Smoke test cass_parameterized_type_with
-        """
-
+    def test_casstype_parameterized(self):
         self.assertEqual(LongType.cass_parameterized_type_with(()), 'LongType')
         self.assertEqual(LongType.cass_parameterized_type_with((), full=True), 'org.apache.cassandra.db.marshal.LongType')
         self.assertEqual(SetType.cass_parameterized_type_with([DecimalType], full=True), 'org.apache.cassandra.db.marshal.SetType(org.apache.cassandra.db.marshal.DecimalType)')
@@ -111,19 +114,141 @@ class TypeTests(unittest.TestCase):
         self.assertEqual(LongType.cql_parameterized_type(), 'bigint')
 
         subtypes = (cassandra.cqltypes.UTF8Type, cassandra.cqltypes.UTF8Type)
-        self.assertEqual(
-                'map<text, text>',
-                cassandra.cqltypes.MapType.apply_parameters(subtypes).cql_parameterized_type())
+        self.assertEqual('map<text, text>',
+                         cassandra.cqltypes.MapType.apply_parameters(subtypes).cql_parameterized_type())
 
-    def test_datetype(self):
-        """
-        Test cassandra.cqltypes.DateType() construction
-        """
-
+    def test_datetype_from_string(self):
         # Ensure all formats can be parsed, without exception
-        for format in cassandra.cqltypes.cql_time_formats:
+        for format in cassandra.cqltypes.cql_timestamp_formats:
             date_string = str(datetime.datetime.now().strftime(format))
             cassandra.cqltypes.DateType(date_string)
+
+    def test_simpledate(self):
+        """
+        Test cassandra.cqltypes.SimpleDateType() construction
+        """
+        Date = cassandra.util.Date
+        # from datetime
+        expected_dt = datetime.datetime(1492, 10, 12, 1, 1)
+        expected_date = Date(expected_dt)
+        self.assertEqual(str(expected_date), '1492-10-12')
+
+        # from string
+        sd = SimpleDateType('1492-10-12')
+        self.assertEqual(sd.val, expected_date)
+        sd = SimpleDateType('+1492-10-12')
+        self.assertEqual(sd.val, expected_date)
+
+        # Date
+        sd = SimpleDateType(expected_date)
+        self.assertEqual(sd.val, expected_date)
+
+        # date
+        sd = SimpleDateType(datetime.date(expected_dt.year, expected_dt.month, expected_dt.day))
+        self.assertEqual(sd.val, expected_date)
+
+        # days
+        sd = SimpleDateType(0)
+        self.assertEqual(sd.val, Date(datetime.date(1970, 1, 1)))
+        sd = SimpleDateType(-1)
+        self.assertEqual(sd.val, Date(datetime.date(1969, 12, 31)))
+        sd = SimpleDateType(1)
+        self.assertEqual(sd.val, Date(datetime.date(1970, 1, 2)))
+        # limits
+        min_builtin = Date(datetime.date(1, 1, 1))
+        max_builtin = Date(datetime.date(9999, 12, 31))
+        self.assertEqual(SimpleDateType(min_builtin.days_from_epoch).val, min_builtin)
+        self.assertEqual(SimpleDateType(max_builtin.days_from_epoch).val, max_builtin)
+        # just proving we can construct with on offset outside buildin range
+        self.assertEqual(SimpleDateType(min_builtin.days_from_epoch - 1).val.days_from_epoch,
+                         min_builtin.days_from_epoch - 1)
+        self.assertEqual(SimpleDateType(max_builtin.days_from_epoch + 1).val.days_from_epoch,
+                         max_builtin.days_from_epoch + 1)
+
+        # no contruct
+        self.assertRaises(ValueError, SimpleDateType, '-1999-10-10')
+        self.assertRaises(TypeError, SimpleDateType, 1.234)
+
+        # str
+        date_str = '2015-03-16'
+        self.assertEqual(str(Date(date_str)), date_str)
+        # out of range
+        self.assertEqual(str(Date(2932897)), '2932897')
+        self.assertEqual(repr(Date(1)), 'Date(1)')
+
+        # eq other types
+        self.assertEqual(Date(1234), 1234)
+        self.assertEqual(Date(1), datetime.date(1970, 1, 2))
+        self.assertFalse(Date(2932897) == datetime.date(9999, 12, 31))  # date can't represent year > 9999
+        self.assertEqual(Date(2932897), 2932897)
+
+    def test_time(self):
+        """
+        Test cassandra.cqltypes.TimeType() construction
+        """
+        Time = cassandra.util.Time
+        one_micro = 1000
+        one_milli = 1000 * one_micro
+        one_second = 1000 * one_milli
+        one_minute = 60 * one_second
+        one_hour = 60 * one_minute
+
+        # from strings
+        tt = TimeType('00:00:00.000000001')
+        self.assertEqual(tt.val, 1)
+        tt = TimeType('00:00:00.000001')
+        self.assertEqual(tt.val, one_micro)
+        tt = TimeType('00:00:00.001')
+        self.assertEqual(tt.val, one_milli)
+        tt = TimeType('00:00:01')
+        self.assertEqual(tt.val, one_second)
+        tt = TimeType('00:01:00')
+        self.assertEqual(tt.val, one_minute)
+        tt = TimeType('01:00:00')
+        self.assertEqual(tt.val, one_hour)
+        tt = TimeType('01:00:00.')
+        self.assertEqual(tt.val, one_hour)
+
+        tt = TimeType('23:59:59.1')
+        tt = TimeType('23:59:59.12')
+        tt = TimeType('23:59:59.123')
+        tt = TimeType('23:59:59.1234')
+        tt = TimeType('23:59:59.12345')
+
+        tt = TimeType('23:59:59.123456')
+        self.assertEqual(tt.val, 23 * one_hour + 59 * one_minute + 59 * one_second + 123 * one_milli + 456 * one_micro)
+
+        tt = TimeType('23:59:59.1234567')
+        self.assertEqual(tt.val, 23 * one_hour + 59 * one_minute + 59 * one_second + 123 * one_milli + 456 * one_micro + 700)
+
+        tt = TimeType('23:59:59.12345678')
+        self.assertEqual(tt.val, 23 * one_hour + 59 * one_minute + 59 * one_second + 123 * one_milli + 456 * one_micro + 780)
+
+        tt = TimeType('23:59:59.123456789')
+        self.assertEqual(tt.val, 23 * one_hour + 59 * one_minute + 59 * one_second + 123 * one_milli + 456 * one_micro + 789)
+
+        # from int
+        tt = TimeType(12345678)
+        self.assertEqual(tt.val, 12345678)
+
+        # from time
+        expected_time = datetime.time(12, 1, 2, 3)
+        tt = TimeType(expected_time)
+        self.assertEqual(tt.val, expected_time)
+
+        # util.Time self equality
+        self.assertEqual(Time(1234), Time(1234))
+
+        # str
+        time_str = '12:13:14.123456789'
+        self.assertEqual(str(Time(time_str)), time_str)
+        self.assertEqual(repr(Time(1)), 'Time(1)')
+
+        # no construct
+        self.assertRaises(ValueError, TimeType, '1999-10-10 11:11:11.1234')
+        self.assertRaises(TypeError, TimeType, 1.234)
+        self.assertRaises(ValueError, TimeType, 123456789000000)
+        self.assertRaises(TypeError, TimeType, datetime.datetime(2004, 12, 23, 11, 11, 1))
 
     def test_cql_typename(self):
         """
@@ -153,7 +278,7 @@ class TypeTests(unittest.TestCase):
 
             @classmethod
             def apply_parameters(cls, subtypes, names):
-                return cls(subtypes, [unhexlify(name) if name is not None else name for name in names])
+                return cls(subtypes, [unhexlify(six.b(name)) if name is not None else name for name in names])
 
         class BarType(FooType):
             typename = 'org.apache.cassandra.db.marshal.BarType'
@@ -180,17 +305,48 @@ class TypeTests(unittest.TestCase):
     def test_empty_value(self):
         self.assertEqual(str(EmptyValue()), 'EMPTY')
 
-    def test_CassandraType(self):
+    def test_cassandratype_base(self):
         cassandra_type = _CassandraType('randomvaluetocheck')
         self.assertEqual(cassandra_type.val, 'randomvaluetocheck')
         self.assertEqual(cassandra_type.validate('randomvaluetocheck2'), 'randomvaluetocheck2')
         self.assertEqual(cassandra_type.val, 'randomvaluetocheck')
 
-    def test_DateType(self):
-        now = datetime.datetime.now()
-        date_type = DateType(now)
-        self.assertEqual(date_type.my_timestamp(), now)
+    def test_datetype(self):
+        now_time_seconds = time.time()
+        now_datetime = datetime.datetime.utcfromtimestamp(now_time_seconds)
+
+        # Cassandra timestamps in millis
+        now_timestamp = now_time_seconds * 1e3
+
+        # same results serialized
+        self.assertEqual(DateType.serialize(now_datetime, 0), DateType.serialize(now_timestamp, 0))
+
+        # from timestamp
+        date_type = DateType(now_timestamp)
+        self.assertEqual(date_type.my_timestamp(), now_timestamp)
+
+        # from datetime object
+        date_type = DateType(now_datetime)
+        self.assertEqual(date_type.my_timestamp(), now_datetime)
+
+        # deserialize
+        # epoc
+        expected = 0
+        self.assertEqual(DateType.deserialize(int64_pack(1000 * expected), 0), datetime.datetime.utcfromtimestamp(expected))
+
+        # beyond 32b
+        expected = 2 ** 33
+        self.assertEqual(DateType.deserialize(int64_pack(1000 * expected), 0), datetime.datetime.utcfromtimestamp(expected))
+
+        # less than epoc (PYTHON-119)
+        expected = -770172256
+        self.assertEqual(DateType.deserialize(int64_pack(1000 * expected), 0), datetime.datetime(1945, 8, 5, 23, 15, 44))
+
         self.assertRaises(ValueError, date_type.interpret_datestring, 'fakestring')
+
+        # work around rounding difference among Python versions (PYTHON-230)
+        expected = 1424817268.274
+        self.assertEqual(DateType.deserialize(int64_pack(int(1000 * expected)), 0), datetime.datetime(2015, 2, 24, 22, 34, 28, 274000))
 
     def test_write_read_string(self):
         with tempfile.TemporaryFile() as f:
